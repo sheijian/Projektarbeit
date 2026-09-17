@@ -16,16 +16,13 @@ from typing import Optional
 import requests
 
 from .game import Player
+from .store import PlayerNotFound, StoreError
 
 log = logging.getLogger(__name__)
 
 
-class PlayerNotFound(Exception):
-    """RFID-UID ist der API unbekannt."""
-
-
-class APIError(Exception):
-    """Allgemeiner API-Fehler."""
+class APIError(StoreError):
+    """HTTP-spezifischer Store-Fehler."""
 
 
 @dataclass

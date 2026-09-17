@@ -46,13 +46,36 @@ zurück, so dass sie am Entwicklungs-PC läuft.
 
 ## Starten
 
+### Volle Konfiguration (RFID + API)
+
 ```bash
 # Mock-API-Server in einem zweiten Terminal
 python -m server.mock_api
 
-# Spiel
+# Spiel mit RFID-Reader und API
 python main.py --api http://localhost:5000
 ```
+
+### Offline-Modus (ohne RFID, ohne API)
+
+Damit das Spiel auch ohne Hardware und ohne Server komplett getestet
+werden kann, gibt es einen Offline-Modus. Er nutzt einen In-Memory-
+Player-Store, der drei vordefinierte Testspieler enthält
+(Alice/Bob/Charlie).
+
+```bash
+# sofort mit "Alice" spielen (kein Chip, kein Server nötig)
+python main.py --offline
+
+# anderer Testspieler
+python main.py --offline --auto-login Bob
+
+# Offline, aber mit simuliertem RFID: Tasten 1/2/3 wechseln Spieler
+python main.py --offline --no-auto-login
+```
+
+In allen Fällen bleiben die Arcade-Taster bzw. der Tastatur-Fallback
+`H` / `S` / `D` / `P` aktiv.
 
 ## Steuerung
 
