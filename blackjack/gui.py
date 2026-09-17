@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+import time
 from typing import List, Optional
 
 import pygame
@@ -20,6 +20,11 @@ from .hand import Hand
 from .render import render_card, render_card_back
 
 
+# Dauer der Slide-in-Animation je Karte.
+DEAL_ANIM = 0.25
+DEAL_SLIDE_PX = 90
+
+
 class BlackjackGUI:
     """Zeichnet den aktuellen Spielzustand."""
 
@@ -35,9 +40,12 @@ class BlackjackGUI:
         self.font_med = pygame.font.SysFont("dejavusans", 26, bold=True)
         self.font_small = pygame.font.SysFont("dejavusans", 16)
 
+        self._now: float = time.monotonic()
+
     # ------------------------------------------------------------------
     def tick(self) -> None:
         self.clock.tick(FPS)
+        self._now = time.monotonic()
         self._draw()
         pygame.display.flip()
 
@@ -57,7 +65,6 @@ class BlackjackGUI:
     def _draw_background(self) -> None:
         self.screen.fill(PALETTE.background)
         w, h = WINDOW_SIZE
-        # Tischbogen
         pygame.draw.ellipse(
             self.screen,
             PALETTE.table_edge,
@@ -73,17 +80,23 @@ class BlackjackGUI:
         label = self.font_med.render("Dealer", True, PALETTE.text_light)
         self.screen.blit(label, (w // 2 - label.get_width() // 2, y - 40))
 
+        # Hole-Card verdeckt, solange der Spielerzug läuft.
         hide_hole = game.state in (
             State.DEALING,
             State.PLAYER_TURN,
         ) and len(game.dealer.cards) >= 2
 
-        cards = game.dealer.cards
-        self._draw_card_row(cards, w // 2, y, hidden_index=1 if hide_hole else None)
+        self._draw_card_row(
+            game.dealer.cards, game.dealer.deal_times,
+            w // 2, y, hidden_index=1 if hide_hole else None,
+        )
 
-        if game.dealer.cards and not hide_hole:
+        # Punktzahl - nur über die tatsächlich sichtbaren Karten.
+        visible = game.dealer.visible_count(self._now)
+        if visible and not hide_hole:
             score = self.font_med.render(
-                str(game.dealer.value), True, PALETTE.accent
+                str(game.dealer.visible_value(self._now)),
+                True, PALETTE.accent,
             )
             self.screen.blit(
                 score,
@@ -99,41 +112,56 @@ class BlackjackGUI:
         if not game.hands:
             return
 
-        # Hände horizontal verteilen.
         n = len(game.hands)
         section_w = w // n
         for idx, hand in enumerate(game.hands):
             cx = section_w * idx + section_w // 2
-            self._draw_hand(hand, cx, y, active=(idx == game.active_hand))
-            # Punktzahl / Einsatz / Ergebnis
+            self._draw_card_row(
+                hand.cards, hand.deal_times, cx, y,
+                highlight=(idx == game.active_hand
+                           and game.state == State.PLAYER_TURN),
+            )
             self._draw_hand_footer(hand, idx, cx, y + CARD_HEIGHT + 6)
 
     def _draw_hand_footer(self, hand: Hand, idx: int, cx: int, y: int) -> None:
         game = self.game
-        # Punktzahl
         color = PALETTE.text_light
-        if hand.is_bust:
+        # Für die Anzeige nutzen wir den Wert der sichtbaren Karten.
+        visible_val = hand.visible_value(self._now)
+        visible_bust = visible_val > 21
+        visible_bj = (
+            hand.visible_count(self._now) == 2
+            and visible_val == 21
+            and not hand.from_split
+        )
+
+        if visible_bust:
             color = PALETTE.danger
-        elif hand.is_blackjack:
+        elif visible_bj:
             color = PALETTE.accent
 
-        score_txt = f"{hand.value}"
-        if hand.is_bust:
+        score_txt = f"{visible_val}"
+        if visible_bust:
             score_txt += " BUST"
-        elif hand.is_blackjack:
+        elif visible_bj:
             score_txt = "BLACKJACK"
-        score = self.font_med.render(score_txt, True, color)
-        self.screen.blit(score, (cx - score.get_width() // 2, y))
 
-        # Einsatz
+        if hand.visible_count(self._now):
+            score = self.font_med.render(score_txt, True, color)
+            self.screen.blit(score, (cx - score.get_width() // 2, y))
+
         bet_txt = f"Einsatz: {hand.bet}"
         if hand.doubled:
             bet_txt += " (Double)"
         bet = self.font_small.render(bet_txt, True, PALETTE.text_light)
         self.screen.blit(bet, (cx - bet.get_width() // 2, y + 34))
 
-        # Ergebnis
-        if game.state == State.ROUND_OVER and idx < len(game.results):
+        # Ergebnis erst zeigen, wenn alle Karten aufgedeckt sind.
+        if (
+            game.state == State.ROUND_OVER
+            and idx < len(game.results)
+            and game.all_cards_revealed(self._now)
+        ):
             result = game.results[idx]
             colors = {
                 Outcome.WIN:       PALETTE.success,
@@ -157,12 +185,10 @@ class BlackjackGUI:
             self.screen.blit(delta_surf, (cx - delta_surf.get_width() // 2, y + 84))
 
     # ------------------------------------------------------------------
-    def _draw_hand(self, hand: Hand, cx: int, y: int, active: bool) -> None:
-        self._draw_card_row(hand.cards, cx, y, highlight=active)
-
     def _draw_card_row(
         self,
         cards: List[Card],
+        deal_times: List[float],
         cx: int,
         y: int,
         hidden_index: Optional[int] = None,
@@ -170,6 +196,14 @@ class BlackjackGUI:
     ) -> None:
         if not cards:
             return
+
+        # Nur bis zur letzten bereits sichtbaren Karte zeichnen.
+        visible = sum(1 for t in deal_times if t <= self._now)
+        if visible == 0:
+            return
+        cards = cards[:visible]
+        deal_times = deal_times[:visible]
+
         overlap = 34
         total_w = CARD_WIDTH + (len(cards) - 1) * (CARD_WIDTH - overlap)
         start_x = cx - total_w // 2
@@ -186,19 +220,27 @@ class BlackjackGUI:
 
         for i, card in enumerate(cards):
             x = start_x + i * (CARD_WIDTH - overlap)
-            # kleine "Deal"-Animation: fliegen leicht rein.
-            offset = int(3 * math.sin((pygame.time.get_ticks() / 250.0) + i))
+            offset_y = self._slide_offset(deal_times[i])
             if hidden_index is not None and i == hidden_index:
                 surf = render_card_back()
             else:
                 surf = render_card(card)
-            self.screen.blit(surf, (x, y + offset))
+            self.screen.blit(surf, (x, y + offset_y))
+
+    def _slide_offset(self, deal_at: float) -> int:
+        """Kleiner Slide-in von oben: die Karte kommt aus dem Deck geflogen."""
+        elapsed = self._now - deal_at
+        if elapsed >= DEAL_ANIM:
+            return 0
+        # Ease-out: (1 - t)^3
+        t = max(0.0, elapsed / DEAL_ANIM)
+        eased = (1.0 - t) ** 3
+        return -int(DEAL_SLIDE_PX * eased)
 
     # ------------------------------------------------------------------
     def _draw_hud(self) -> None:
         w, _ = WINDOW_SIZE
         game = self.game
-        # Oberer Balken
         pygame.draw.rect(self.screen, PALETTE.table_edge, (0, 0, w, 50))
         if game.player:
             info = f"Spieler: {game.player.name}   Guthaben: {game.player.balance}"
@@ -214,9 +256,21 @@ class BlackjackGUI:
     # ------------------------------------------------------------------
     def _draw_message(self) -> None:
         game = self.game
-        if not game.message:
+        # Solange nicht alle Karten aufgedeckt sind, zeigen wir eine neutrale
+        # "Karten werden ausgeteilt"-Meldung statt sofort das Ergebnis.
+        msg = game.message
+        if (
+            game.state in (State.ROUND_OVER, State.DEALER_TURN)
+            and not game.all_cards_revealed(self._now)
+        ):
+            if game.state == State.ROUND_OVER and game.dealer.all_revealed(self._now):
+                pass  # Ergebnis darf schon durch
+            else:
+                msg = "Dealer spielt …"
+        if not msg:
             return
-        surf = self.font_big.render(game.message, True, PALETTE.text_light)
+
+        surf = self.font_big.render(msg, True, PALETTE.text_light)
         w, _ = WINDOW_SIZE
         rect = surf.get_rect(center=(w // 2, 340))
 
@@ -232,17 +286,30 @@ class BlackjackGUI:
         y = h - 70
         game = self.game
 
-        actions = [
-            ("HIT",    "H", game.state == State.PLAYER_TURN
-                              or game.state in (State.BETTING, State.ROUND_OVER)),
-            ("STAND",  "S", game.state == State.PLAYER_TURN),
-            ("DOUBLE", "D", game.state == State.PLAYER_TURN
-                              and self._current_hand()
-                              and self._current_hand().can_double),
-            ("SPLIT",  "P", game.state == State.PLAYER_TURN
-                              and self._current_hand()
-                              and self._current_hand().can_split),
-        ]
+        # Labels je nach Zustand: im Betting/ROUND_OVER ist die Hit-Taste der
+        # Einsatz-Zyklus, die Stand-Taste startet die Runde.
+        in_bet_phase = game.state in (State.BETTING, State.ROUND_OVER)
+        current_hand = self._current_hand()
+
+        if in_bet_phase:
+            actions = [
+                ("EINSATZ +", "H", game.player is not None),
+                ("DEAL",      "S", game.player is not None
+                                    and game.player.balance >= game.current_bet),
+                ("DOUBLE",    "D", False),
+                ("SPLIT",     "P", False),
+            ]
+        else:
+            actions = [
+                ("HIT",    "H", game.state == State.PLAYER_TURN),
+                ("STAND",  "S", game.state == State.PLAYER_TURN),
+                ("DOUBLE", "D", game.state == State.PLAYER_TURN
+                                 and current_hand is not None
+                                 and current_hand.can_double),
+                ("SPLIT",  "P", game.state == State.PLAYER_TURN
+                                 and current_hand is not None
+                                 and current_hand.can_split),
+            ]
 
         btn_w = 180
         spacing = 20

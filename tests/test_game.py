@@ -64,15 +64,15 @@ def test_player_busts_and_loses_bet():
 def test_blackjack_pays_three_to_two():
     sequence = [C("A"), C("9"), C("K"), C("7")]
     game = make_game(sequence)
-    game.login(Player("uid", "Tester", 100), default_bet=20)
+    game.login(Player("uid", "Tester", 100), default_bet=25)
     game.start_round()
     # Spieler hat Blackjack → sofort in ROUND_OVER.
     assert game.state == State.ROUND_OVER
     r = game.results[0]
     assert r.outcome == Outcome.BLACKJACK
-    # 20 Einsatz, Rückzahlung 20 + 30 = 50
-    assert r.payout == 50
-    assert game.player.balance == 100 - 20 + 50
+    # 25 Einsatz, Rückzahlung 25 + int(25*1.5) = 25 + 37 = 62
+    assert r.payout == 62
+    assert game.player.balance == 100 - 25 + 62
 
 
 def test_double_draws_one_card_and_ends_hand():
@@ -80,15 +80,15 @@ def test_double_draws_one_card_and_ends_hand():
     #  Dealer:   K, 8  → 18
     sequence = [C("5"), C("K"), C("9"), C("8"), C("7")]
     game = make_game(sequence)
-    game.login(Player("uid", "Tester", 100), default_bet=20)
+    game.login(Player("uid", "Tester", 100), default_bet=25)
     game.start_round()
     game.double()
     assert game.state == State.ROUND_OVER
     r = game.results[0]
-    assert r.bet == 40
+    assert r.bet == 50
     assert r.outcome == Outcome.WIN
-    # Spielverlauf: -20 (Einsatz), -20 (Double), +80 (Auszahlung) = +40
-    assert game.player.balance == 140
+    # Spielverlauf: -25 (Einsatz), -25 (Double), +100 (Auszahlung) = +50
+    assert game.player.balance == 150
 
 
 def test_push_returns_bet():
@@ -114,7 +114,7 @@ def test_split_creates_two_hands():
         C("2"),            # Nach Split für Hand 2
     ]
     game = make_game(sequence)
-    game.login(Player("uid", "Tester", 200), default_bet=20)
+    game.login(Player("uid", "Tester", 200), default_bet=25)
     game.start_round()
     game.split()
     assert len(game.hands) == 2
@@ -126,8 +126,8 @@ def test_split_creates_two_hands():
     # Beide unter dem Dealer → zwei Verluste.
     outcomes = [r.outcome for r in game.results]
     assert outcomes == [Outcome.LOSE, Outcome.LOSE]
-    # Guthaben: 200 - 20 - 20 = 160
-    assert game.player.balance == 160
+    # Guthaben: 200 - 25 - 25 = 150
+    assert game.player.balance == 150
 
 
 def test_split_of_aces_gets_only_one_card_each():
@@ -138,7 +138,7 @@ def test_split_of_aces_gets_only_one_card_each():
         C("6"),  # Hand 2
     ]
     game = make_game(sequence)
-    game.login(Player("uid", "Tester", 200), default_bet=20)
+    game.login(Player("uid", "Tester", 200), default_bet=25)
     game.start_round()
     game.split()
     # Nach Ass-Split sind beide Hände automatisch fertig.

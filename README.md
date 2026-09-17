@@ -86,6 +86,19 @@ In allen Fällen bleiben die Arcade-Taster bzw. der Tastatur-Fallback
 | Double   | GPIO 22                 | `D`      |
 | Split    | GPIO 23                 | `P`      |
 
+Während des Spielerzugs bedeuten die vier Taster genau das, was oben
+steht. **Zwischen zwei Runden** (vor dem Deal bzw. nach einer Runde)
+werden die beiden linken Taster umgewidmet:
+
+| Zustand         | Hit-Taste            | Stand-Taste      |
+|-----------------|----------------------|------------------|
+| Spielerzug      | Karte ziehen         | Passen           |
+| Vor der Runde   | **Einsatz erhöhen** (zyklisch) | **Deal starten** |
+
+Die Einsatzstufen sind 10, 25, 50, 100, 250, 500, 1000. Beim Erreichen der
+höchsten Stufe springt der Wert wieder auf 10 - so reicht ein einziger
+Knopf für die komplette Einsatz-Bedienung.
+
 Der RFID-Chip wird beim Auflegen automatisch gelesen. Im Mock-Modus
 kann mit `1`, `2`, `3` ein Test-Chip simuliert werden.
 

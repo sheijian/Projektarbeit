@@ -2,9 +2,9 @@
 
 Der Ablauf einer Runde:
 
-    WAITING_FOR_PLAYER  -> RFID scannen, Guthaben laden
-        -> BETTING       -> Einsatz bestätigen (Start-Taste = "Hit")
-        -> DEALING       -> Karten austeilen
+    NO_PLAYER  -> RFID scannen, Guthaben laden
+        -> BETTING       -> Einsatz per Hit-Taste hochzählen (zyklisch), Stand = Deal
+        -> DEALING       -> Karten austeilen (nur GUI-Animation, Logik ist synchron)
         -> PLAYER_TURN   -> Hit / Stand / Double / Split
         -> DEALER_TURN
         -> RESOLVING     -> Gewinn / Verlust
@@ -13,9 +13,10 @@ Der Ablauf einer Runde:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .cards import Deck
 from .hand import Hand
@@ -36,6 +37,20 @@ class Outcome(Enum):
     LOSE = "lose"
     PUSH = "push"
     BLACKJACK = "blackjack"
+
+
+# ---------------------------------------------------------------------------
+# Verfügbare Einsatzstufen. Die Hit-Taste zyklt durch die Werte, die zum
+# aktuellen Guthaben passen, und startet danach wieder beim kleinsten.
+BET_STEPS: Tuple[int, ...] = (10, 25, 50, 100, 250, 500, 1000)
+
+
+# ---------------------------------------------------------------------------
+# Timing (Sekunden) - nur für die GUI-Animation. Die Logik ist synchron.
+DEAL_INTERVAL = 0.35        # zwischen zwei Karten beim Austeilen
+HIT_DELAY = 0.20            # Verzögerung für eine einzelne Hit-/Double-Karte
+DEALER_INTERVAL = 0.55      # zwischen Dealer-Karten
+FLIP_DELAY = 0.35           # kleiner Puffer vor dem Aufdecken der Hole-Card
 
 
 @dataclass
@@ -78,13 +93,15 @@ class Game:
         self.results: List[RoundResult] = []
         self.message: str = "Bitte RFID-Chip auflegen"
         self.on_balance_change = on_balance_change
+        # Für die Deal-Animation: nächstmöglicher Aufdeck-Zeitpunkt.
+        self._next_deal_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Spieler-Session
     # ------------------------------------------------------------------
     def login(self, player: Player, default_bet: int) -> None:
         self.player = player
-        self.current_bet = max(self.min_bet, min(default_bet, player.balance))
+        self.current_bet = self._closest_bet(default_bet)
         self.hands = []
         self.dealer = Hand()
         self.active_hand = 0
@@ -124,11 +141,14 @@ class Game:
         self.state = State.DEALING
         self.message = "Karten werden ausgeteilt …"
 
-        # Klassisches Blackjack-Deal: Spieler, Dealer, Spieler, Dealer.
-        self.hands[0].add(self.deck.draw())
-        self.dealer.add(self.deck.draw())
-        self.hands[0].add(self.deck.draw())
-        self.dealer.add(self.deck.draw())
+        # Deal-Animation zurücksetzen und die vier Startkarten mit gestaffelten
+        # Zeitpunkten registrieren - die GUI blendet sie einzeln ein.
+        self._next_deal_at = time.monotonic()
+        # Klassisches Deal: Spieler, Dealer, Spieler, Dealer.
+        self.hands[0].add(self.deck.draw(), deal_at=self._schedule(DEAL_INTERVAL))
+        self.dealer.add(self.deck.draw(),   deal_at=self._schedule(DEAL_INTERVAL))
+        self.hands[0].add(self.deck.draw(), deal_at=self._schedule(DEAL_INTERVAL))
+        self.dealer.add(self.deck.draw(),   deal_at=self._schedule(DEAL_INTERVAL))
 
         self._enter_player_turn()
 
@@ -136,18 +156,22 @@ class Game:
     # Aktionen des Spielers
     # ------------------------------------------------------------------
     def hit(self) -> None:
-        if self.state == State.BETTING or self.state == State.ROUND_OVER:
-            # Hit dient außerhalb einer Runde als "Deal / nächste Runde"-Taste.
-            self.start_round()
+        if self.state in (State.BETTING, State.ROUND_OVER):
+            # Außerhalb einer Runde: Einsatz zyklisch erhöhen.
+            self.cycle_bet()
             return
         if self.state != State.PLAYER_TURN:
             return
         hand = self.hands[self.active_hand]
-        hand.add(self.deck.draw())
+        hand.add(self.deck.draw(), deal_at=self._schedule(HIT_DELAY))
         if hand.is_done:
             self._advance_hand()
 
     def stand(self) -> None:
+        if self.state in (State.BETTING, State.ROUND_OVER):
+            # Außerhalb einer Runde startet Stand die nächste Runde.
+            self.start_round()
+            return
         if self.state != State.PLAYER_TURN:
             return
         self.hands[self.active_hand].stood = True
@@ -167,7 +191,7 @@ class Game:
         self._change_balance(-hand.bet)
         hand.bet *= 2
         hand.doubled = True
-        hand.add(self.deck.draw())
+        hand.add(self.deck.draw(), deal_at=self._schedule(HIT_DELAY))
         hand.stood = True
         self._advance_hand()
 
@@ -186,14 +210,23 @@ class Game:
         self._change_balance(-hand.bet)
         card_a, card_b = hand.cards
         aces = card_a.rank == "A"
-        new_hand = Hand(cards=[card_b], bet=hand.bet, from_split=True, split_aces=aces)
+
+        # Die ursprünglichen Zeitstempel beibehalten, damit die "geteilten"
+        # Karten sofort sichtbar bleiben.
+        t_a, t_b = hand.deal_times
+
+        new_hand = Hand(
+            cards=[card_b], deal_times=[t_b],
+            bet=hand.bet, from_split=True, split_aces=aces,
+        )
         hand.cards = [card_a]
+        hand.deal_times = [t_a]
         hand.from_split = True
         hand.split_aces = aces
 
-        # Neue Karte für beide Hälften ziehen.
-        hand.add(self.deck.draw())
-        new_hand.add(self.deck.draw())
+        # Neue Karte für beide Hälften ziehen - versetzt aufgedeckt.
+        hand.add(self.deck.draw(), deal_at=self._schedule(HIT_DELAY))
+        new_hand.add(self.deck.draw(), deal_at=self._schedule(HIT_DELAY))
 
         self.hands.insert(self.active_hand + 1, new_hand)
 
@@ -204,31 +237,56 @@ class Game:
             self._advance_hand()
             return
 
-        # Erste geteilte Hand ist aktiv, evtl. sofort fertig (21).
         if hand.is_done:
             self._advance_hand()
         else:
             self.message = f"Hand {self.active_hand + 1}/{len(self.hands)}"
 
     # ------------------------------------------------------------------
-    # Einsatz ändern (vor Rundenstart)
+    # Einsatz (zyklische Schaltfläche)
     # ------------------------------------------------------------------
-    def increase_bet(self, step: int = 5) -> None:
+    def cycle_bet(self) -> None:
+        """Springt zum nächsten Einsatz aus BET_STEPS. Nach dem größten geht's
+        wieder auf den kleinsten - so reicht ein einziger Knopf."""
         if self.state not in (State.BETTING, State.ROUND_OVER) or self.player is None:
             return
-        new_bet = min(self.current_bet + step, self.player.balance)
-        self.current_bet = max(self.min_bet, new_bet)
+        options = self._available_bets()
+        if not options:
+            self.message = "Guthaben zu niedrig"
+            return
+
+        try:
+            idx = options.index(self.current_bet)
+            next_idx = (idx + 1) % len(options)
+        except ValueError:
+            # Aktueller Einsatz nicht in der Liste - nimm die kleinste Option.
+            next_idx = 0
+
+        self.current_bet = options[next_idx]
         self.message = f"Einsatz: {self.current_bet}"
 
-    def decrease_bet(self, step: int = 5) -> None:
-        if self.state not in (State.BETTING, State.ROUND_OVER):
-            return
-        self.current_bet = max(self.min_bet, self.current_bet - step)
-        self.message = f"Einsatz: {self.current_bet}"
+    def _available_bets(self) -> List[int]:
+        assert self.player is not None
+        return [b for b in BET_STEPS if self.min_bet <= b <= self.player.balance]
+
+    def _closest_bet(self, wanted: int) -> int:
+        """Wählt die BET_STEPS-Stufe, die dem Wunschwert am nächsten kommt."""
+        assert self.player is not None
+        options = self._available_bets()
+        if not options:
+            # Fallback: min_bet, auch wenn das Guthaben eigentlich zu niedrig ist.
+            return self.min_bet
+        return min(options, key=lambda b: abs(b - wanted))
 
     # ------------------------------------------------------------------
     # Interne Übergänge
     # ------------------------------------------------------------------
+    def _schedule(self, interval: float) -> float:
+        """Liefert den Zeitpunkt, an dem die nächste Karte aufgedeckt werden soll."""
+        now = time.monotonic()
+        self._next_deal_at = max(self._next_deal_at, now) + interval
+        return self._next_deal_at
+
     def _enter_player_turn(self) -> None:
         self.state = State.PLAYER_TURN
         self.message = "Dein Zug"
@@ -237,7 +295,6 @@ class Game:
             self._advance_hand()
 
     def _advance_hand(self) -> None:
-        # Nächste noch nicht fertige Hand suchen.
         for idx in range(self.active_hand, len(self.hands)):
             if not self.hands[idx].is_done:
                 self.active_hand = idx
@@ -255,15 +312,18 @@ class Game:
         self.message = "Dealer spielt"
 
         any_alive = any(not h.is_bust and not h.surrendered for h in self.hands)
-        # Wenn alle lebenden Hände natürliche Blackjacks sind, muss der Dealer
-        # nur seine Startkarten prüfen (kein Zug nötig).
         all_blackjack = all(
             h.is_blackjack or h.is_bust or h.surrendered for h in self.hands
         )
         if any_alive and not all_blackjack:
-            # Dealer zieht bis mindestens 17 (hier: Stand auf Soft 17).
+            # kleiner Puffer, damit die Hole-Card sichtbar aufgedeckt aussieht.
+            self._schedule(FLIP_DELAY)
+            # Dealer zieht bis mindestens 17 (Stand auf Soft 17).
             while self.dealer.value < 17:
-                self.dealer.add(self.deck.draw())
+                self.dealer.add(
+                    self.deck.draw(),
+                    deal_at=self._schedule(DEALER_INTERVAL),
+                )
         self._resolve()
 
     def _resolve(self) -> None:
@@ -290,7 +350,6 @@ class Game:
         if hand.is_bust:
             return Outcome.LOSE, 0
         if hand.is_blackjack and not dealer_bj:
-            # 3:2 Auszahlung: Einsatz + 1,5× Einsatz
             return Outcome.BLACKJACK, hand.bet + int(hand.bet * 1.5)
         if dealer_bj and not hand.is_blackjack:
             return Outcome.LOSE, 0
@@ -309,6 +368,14 @@ class Game:
         if delta < 0:
             return f"Verloren: {delta}"
         return "Unentschieden"
+
+    # ------------------------------------------------------------------
+    # GUI-Helfer
+    # ------------------------------------------------------------------
+    def all_cards_revealed(self, now: Optional[float] = None) -> bool:
+        """True, wenn alle Karten aller Hände und des Dealers sichtbar sind."""
+        hands = [self.dealer, *self.hands]
+        return all(h.all_revealed(now) for h in hands)
 
     def _change_balance(self, delta: int) -> None:
         if self.player is None:
