@@ -79,22 +79,35 @@ In allen Fällen bleiben die Arcade-Taster bzw. der Tastatur-Fallback
 
 ## Steuerung
 
-Das Arcade-Board hat vier Taster-Anschlüsse mit den Beschriftungen
-**K1, K2, K3, K4**. Welche BCM-GPIO-Pins des Raspberry Pi dahinter
-hängen, steht in `blackjack/config.py` unter `K_PINS`.
+Das verwendete Arcade-Board (**EG STARTS Zero-Delay-Encoder**) wird per
+USB an den Pi angeschlossen und meldet sich dort als HID-Gamepad. Die
+vier Taster-Anschlüsse sind mit **K1, K2, K3, K4** beschriftet und
+bekommen vom Board jeweils eine feste Button-Nummer zugeteilt.
 
-Falls du die Zuordnung nicht kennst: einfach
+Standardmäßig wählt die Anwendung die beste verfügbare Eingabe
+automatisch (`--input auto`): USB-Gamepad → GPIO → Tastatur.
+Explizit setzen kannst du sie mit
 
 ```bash
-sudo python -m scripts.find_pins
+python main.py --input usb        # USB-Encoder (Standard für das Board)
+python main.py --input gpio       # Taster direkt am Pi-Header
+python main.py --input keyboard   # nur Tastatur (H/S/D/P)
 ```
 
-auf dem Pi ausführen und der Reihe nach K1 … K4 drücken - das Skript
-sagt dir jeweils die BCM-Nummer, die du in `K_PINS` eintragen musst.
+Welche Button-Nummern K1..K4 beim USB-Encoder haben, kannst du in einer
+halben Minute selbst herausfinden:
+
+```bash
+python -m scripts.find_buttons
+```
+
+Ein kleines Fenster öffnet sich; K1..K4 der Reihe nach drücken → die
+angezeigten Nummern in `blackjack/config.py` unter `K_JOY_BUTTONS`
+eintragen. Analog für den GPIO-Modus mit `scripts/find_pins.py`.
 
 Welche Aktion an welchem physischen Anschluss hängt, legt `K_ACTIONS`
-fest (Default: K1=Hit, K2=Stand, K3=Double, K4=Split). Tauschen ohne
-Umsteckerei geht dort in einer Zeile.
+fest. Tauschen (z. B. Stand auf K1 statt K2) geht dort in einer Zeile,
+ohne die Kabel zu berühren.
 
 | Aktion   | Anschluss (Default) | Tastatur |
 |----------|---------------------|----------|

@@ -58,7 +58,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--min-bet", type=int, default=DEFAULT_MIN_BET)
     p.add_argument("--default-bet", type=int, default=DEFAULT_BET)
-    p.add_argument("--no-gpio", action="store_true", help="GPIO-Taster ignorieren")
+    p.add_argument(
+        "--input", choices=("auto", "usb", "gpio", "keyboard"), default="auto",
+        help="Eingabequelle für die Arcade-Taster (Default: auto - USB, dann GPIO)",
+    )
     p.add_argument("--no-rfid", action="store_true", help="MFRC522-Modul ignorieren")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -75,7 +78,9 @@ class App:
             on_balance_change=self._on_balance_change,
         )
         self.gui = BlackjackGUI(self.game)
-        self.buttons = ButtonHandler(use_gpio=None if not args.no_gpio else False)
+        # WICHTIG: pygame ist durch die GUI schon initialisiert - der
+        # ButtonHandler kann daher den Joystick-Subsystem-Init sauber machen.
+        self.buttons = ButtonHandler(mode=args.input)
 
         # Im Offline-Modus mit Auto-Login brauchen wir gar keinen RFID-Reader,
         # sonst starten wir ihn (mit Hardware oder als Mock).

@@ -5,29 +5,11 @@ from typing import Dict
 
 
 # ---------------------------------------------------------------------------
-# Arcade-Board: physische Anschlüsse -> BCM-GPIO-Pins
+# Arcade-Board: welcher physische Anschluss löst welche Spiel-Aktion aus?
 # ---------------------------------------------------------------------------
-# Auf dem verwendeten Arcade-Board sind die vier Taster-Anschlüsse mit
-# K1..K4 beschriftet. Hier steht, an welchen BCM-GPIO-Pin des Raspberry Pi
-# jeder dieser Anschlüsse verdrahtet ist.
-#
-# Nachschauen kann man das:
-#   * in der Anleitung / auf dem Aufdruck des Boards,
-#   * mit einem einfachen Test-Skript (siehe scripts/find_pins.py).
-#
-# Falls das Board eine andere Verdrahtung hat, hier einfach die Zahlen
-# anpassen - dann werden die Taster automatisch übernommen.
-K_PINS: Dict[str, int] = {
-    "K1": 17,
-    "K2": 27,
-    "K3": 22,
-    "K4": 23,
-}
-
-
-# Welcher physische Taster (K1..K4) löst welche Spiel-Aktion aus?
-# Reihenfolge frei wählbar - im Zweifel einfach die Kabel anders anschließen
-# oder hier tauschen.
+# Auf dem verwendeten Arcade-Board sind die Taster-Anschlüsse mit K1..K4
+# beschriftet. Die Zuordnung "Anschluss -> Aktion" ist frei wählbar - im
+# Zweifel einfach die Kabel anders aufstecken oder hier tauschen.
 K_ACTIONS: Dict[str, str] = {
     "K1": "hit",
     "K2": "stand",
@@ -36,15 +18,55 @@ K_ACTIONS: Dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# USB-Modus (Zero-Delay-Encoder wie EG STARTS)
+# ---------------------------------------------------------------------------
+# Das Board wird per USB als HID-Gamepad erkannt. Jede K-Belegung entspricht
+# einer Button-Nummer. Die Reihenfolge kann sich je nach Firmware unter-
+# scheiden. Mit `python -m scripts.find_buttons` kannst du die tatsächlichen
+# Nummern in wenigen Sekunden ermitteln und hier eintragen.
+K_JOY_BUTTONS: Dict[str, int] = {
+    "K1": 0,
+    "K2": 1,
+    "K3": 2,
+    "K4": 3,
+}
+
+
+# ---------------------------------------------------------------------------
+# GPIO-Modus (falls die Taster direkt am 40-Pin-Header des Pi hängen)
+# ---------------------------------------------------------------------------
+K_PINS: Dict[str, int] = {
+    "K1": 17,
+    "K2": 27,
+    "K3": 22,
+    "K4": 23,
+}
+
+
 def build_button_pins(
     k_pins: Dict[str, int] = K_PINS,
     k_actions: Dict[str, str] = K_ACTIONS,
 ) -> Dict[str, int]:
-    """Baut die Aktion -> GPIO-Pin-Zuordnung aus der K1..K4-Belegung."""
+    """Aktion -> GPIO-Pin aus der K1..K4-Belegung."""
     return {action: k_pins[k] for k, action in k_actions.items()}
 
 
+def build_button_joy(
+    k_buttons: Dict[str, int] = K_JOY_BUTTONS,
+    k_actions: Dict[str, str] = K_ACTIONS,
+) -> Dict[str, int]:
+    """Aktion -> USB-Joystick-Button-Index aus der K1..K4-Belegung."""
+    return {action: k_buttons[k] for k, action in k_actions.items()}
+
+
 BUTTON_PINS: Dict[str, int] = build_button_pins()
+BUTTON_JOY:  Dict[str, int] = build_button_joy()
+
+
+# Wenn mehrere USB-Gamepads angesteckt sind, wählt diese Nummer den
+# Encoder aus (0 = das erste erkannte Gerät).
+JOY_INDEX: int = 0
 
 
 # Tastatur-Fallback, wenn kein GPIO verfügbar ist.
