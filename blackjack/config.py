@@ -5,14 +5,46 @@ from typing import Dict
 
 
 # ---------------------------------------------------------------------------
-# GPIO-Pin-Belegung (BCM-Nummerierung)
+# Arcade-Board: physische Anschlüsse -> BCM-GPIO-Pins
 # ---------------------------------------------------------------------------
-BUTTON_PINS: Dict[str, int] = {
-    "hit":    17,
-    "stand":  27,
-    "double": 22,
-    "split":  23,
+# Auf dem verwendeten Arcade-Board sind die vier Taster-Anschlüsse mit
+# K1..K4 beschriftet. Hier steht, an welchen BCM-GPIO-Pin des Raspberry Pi
+# jeder dieser Anschlüsse verdrahtet ist.
+#
+# Nachschauen kann man das:
+#   * in der Anleitung / auf dem Aufdruck des Boards,
+#   * mit einem einfachen Test-Skript (siehe scripts/find_pins.py).
+#
+# Falls das Board eine andere Verdrahtung hat, hier einfach die Zahlen
+# anpassen - dann werden die Taster automatisch übernommen.
+K_PINS: Dict[str, int] = {
+    "K1": 17,
+    "K2": 27,
+    "K3": 22,
+    "K4": 23,
 }
+
+
+# Welcher physische Taster (K1..K4) löst welche Spiel-Aktion aus?
+# Reihenfolge frei wählbar - im Zweifel einfach die Kabel anders anschließen
+# oder hier tauschen.
+K_ACTIONS: Dict[str, str] = {
+    "K1": "hit",
+    "K2": "stand",
+    "K3": "double",
+    "K4": "split",
+}
+
+
+def build_button_pins(
+    k_pins: Dict[str, int] = K_PINS,
+    k_actions: Dict[str, str] = K_ACTIONS,
+) -> Dict[str, int]:
+    """Baut die Aktion -> GPIO-Pin-Zuordnung aus der K1..K4-Belegung."""
+    return {action: k_pins[k] for k, action in k_actions.items()}
+
+
+BUTTON_PINS: Dict[str, int] = build_button_pins()
 
 
 # Tastatur-Fallback, wenn kein GPIO verfügbar ist.

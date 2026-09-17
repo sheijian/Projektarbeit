@@ -79,12 +79,29 @@ In allen Fällen bleiben die Arcade-Taster bzw. der Tastatur-Fallback
 
 ## Steuerung
 
-| Aktion   | Arcade-Taste (GPIO-Pin) | Tastatur |
-|----------|-------------------------|----------|
-| Hit      | GPIO 17                 | `H`      |
-| Stand    | GPIO 27                 | `S`      |
-| Double   | GPIO 22                 | `D`      |
-| Split    | GPIO 23                 | `P`      |
+Das Arcade-Board hat vier Taster-Anschlüsse mit den Beschriftungen
+**K1, K2, K3, K4**. Welche BCM-GPIO-Pins des Raspberry Pi dahinter
+hängen, steht in `blackjack/config.py` unter `K_PINS`.
+
+Falls du die Zuordnung nicht kennst: einfach
+
+```bash
+sudo python -m scripts.find_pins
+```
+
+auf dem Pi ausführen und der Reihe nach K1 … K4 drücken - das Skript
+sagt dir jeweils die BCM-Nummer, die du in `K_PINS` eintragen musst.
+
+Welche Aktion an welchem physischen Anschluss hängt, legt `K_ACTIONS`
+fest (Default: K1=Hit, K2=Stand, K3=Double, K4=Split). Tauschen ohne
+Umsteckerei geht dort in einer Zeile.
+
+| Aktion   | Anschluss (Default) | Tastatur |
+|----------|---------------------|----------|
+| Hit      | K1                  | `H`      |
+| Stand    | K2                  | `S`      |
+| Double   | K3                  | `D`      |
+| Split    | K4                  | `P`      |
 
 Während des Spielerzugs bedeuten die vier Taster genau das, was oben
 steht. **Zwischen zwei Runden** (vor dem Deal bzw. nach einer Runde)
