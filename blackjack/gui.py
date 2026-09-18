@@ -26,27 +26,71 @@ DEAL_SLIDE_PX = 90
 
 
 class BlackjackGUI:
-    """Zeichnet den aktuellen Spielzustand."""
+    """Zeichnet den aktuellen Spielzustand.
+
+    Der eigentliche Tisch wird immer in einen festen 1280×800-Zwischenpuffer
+    (``self.screen``) gezeichnet. Beim Ausgeben auf das Anwendungsfenster
+    (``self.window``) wird dieser Puffer mit erhaltenem Seitenverhältnis
+    skaliert und zentriert - so bleibt die Anzeige im Vollbild oder bei
+    beliebiger Fenstergröße korrekt proportioniert.
+    """
 
     def __init__(self, game: Game) -> None:
         self.game = game
         pygame.init()
         pygame.display.set_caption("Blackjack – Projektarbeit")
-        self.screen = pygame.display.set_mode(WINDOW_SIZE)
+
+        self._logical_size = WINDOW_SIZE
+        self.window = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
+        self.screen = pygame.Surface(self._logical_size)
+        self._fullscreen = False
+
         self.clock = pygame.time.Clock()
 
         self.font_hud = pygame.font.SysFont("dejavusans", 22, bold=True)
         self.font_big = pygame.font.SysFont("dejavusans", 44, bold=True)
         self.font_med = pygame.font.SysFont("dejavusans", 26, bold=True)
         self.font_small = pygame.font.SysFont("dejavusans", 16)
+        self.font_note  = pygame.font.SysFont("dejavusans", 18, italic=True)
 
         self._now: float = time.monotonic()
+
+    # ------------------------------------------------------------------
+    def toggle_fullscreen(self) -> None:
+        self._fullscreen = not self._fullscreen
+        if self._fullscreen:
+            self.window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            self.window = pygame.display.set_mode(
+                self._logical_size, pygame.RESIZABLE,
+            )
+
+    def handle_pygame_event(self, event: pygame.event.Event) -> None:
+        """Fenster-Events (Vollbild-Toggle, Resize)."""
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+            self.toggle_fullscreen()
+        elif event.type == pygame.VIDEORESIZE and not self._fullscreen:
+            # Nur informativ - Auslesen der Größe erfolgt in _present().
+            pass
 
     # ------------------------------------------------------------------
     def tick(self) -> None:
         self.clock.tick(FPS)
         self._now = time.monotonic()
         self._draw()
+        self._present()
+
+    def _present(self) -> None:
+        """Skaliert den logischen Puffer letterbox-artig auf das Fenster."""
+        ww, wh = self.window.get_size()
+        lw, lh = self._logical_size
+        if ww <= 0 or wh <= 0:
+            return
+        scale = min(ww / lw, wh / lh)
+        tw, th = max(1, int(lw * scale)), max(1, int(lh * scale))
+        scaled = pygame.transform.smoothscale(self.screen, (tw, th))
+        self.window.fill((0, 0, 0))
+        self.window.blit(scaled, ((ww - tw) // 2, (wh - th) // 2))
         pygame.display.flip()
 
     def close(self) -> None:
@@ -56,6 +100,7 @@ class BlackjackGUI:
     def _draw(self) -> None:
         self._draw_background()
         self._draw_dealer()
+        self._draw_dealer_rule()
         self._draw_player()
         self._draw_hud()
         self._draw_message()
@@ -71,6 +116,28 @@ class BlackjackGUI:
             pygame.Rect(-100, 60, w + 200, h - 120),
             width=6,
         )
+
+    # ------------------------------------------------------------------
+    def _draw_dealer_rule(self) -> None:
+        """Casino-typischer Hinweis auf dem Filz: Dealer zieht bis 17."""
+        w, h = WINDOW_SIZE
+        text = "Dealer bleibt bei 17 stehen und zieht keine weitere Karte"
+
+        surf = self.font_note.render(text, True, (235, 230, 210))
+        # Zwischen der Ergebnismeldung (y ≈ 340) und den Spielerkarten (y ≈ 530).
+        cx, cy = w // 2, 430
+        rect = surf.get_rect(center=(cx, cy))
+
+        # Dezenter, halbtransparenter Untergrund - hebt den Text vom Filz ab.
+        bg = pygame.Rect(rect).inflate(40, 14)
+        strip = pygame.Surface(bg.size, pygame.SRCALPHA)
+        strip.fill((0, 0, 0, 70))
+        self.screen.blit(strip, bg.topleft)
+        pygame.draw.rect(
+            self.screen, (200, 180, 120), bg,
+            width=1, border_radius=6,
+        )
+        self.screen.blit(surf, rect)
 
     # ------------------------------------------------------------------
     def _draw_dealer(self) -> None:

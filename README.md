@@ -116,6 +116,17 @@ ohne die Kabel zu berühren.
 | Double   | K3                  | `D`      |
 | Split    | K4                  | `P`      |
 
+Zusätzliche Tasten:
+
+| Aktion            | Tastatur       |
+|-------------------|----------------|
+| Vollbild an/aus   | `F11`          |
+| Spiel beenden     | `Esc`          |
+
+Das Spielfeld hat eine feste logische Auflösung von 1280×800 und wird
+beim Zeichnen mit erhaltenem Seitenverhältnis auf das aktuelle Fenster
+skaliert - im Vollbild bleibt es also mittig und korrekt proportioniert.
+
 Während des Spielerzugs bedeuten die vier Taster genau das, was oben
 steht. **Zwischen zwei Runden** (vor dem Deal bzw. nach einer Runde)
 werden die beiden linken Taster umgewidmet:

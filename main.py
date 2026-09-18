@@ -115,6 +115,7 @@ class App:
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
                 else:
+                    self.gui.handle_pygame_event(event)
                     self.buttons.handle_pygame_event(event)
                     if self.rfid is not None:
                         self.rfid.handle_pygame_event(event)
