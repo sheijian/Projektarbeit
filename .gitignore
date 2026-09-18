@@ -7,3 +7,4 @@ venv/
 blackjack.db
 *.db-journal
 .coverage
+.env

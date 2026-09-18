@@ -46,14 +46,25 @@ zurück, so dass sie am Entwicklungs-PC läuft.
 
 ## Starten
 
-### Volle Konfiguration (RFID + API)
+### Produktivbetrieb (RFID + InfluxDB)
+
+```bash
+# einmalig: .env mit Zugangsdaten füllen und Test-Spieler seeden
+cp .env.example .env
+python -m scripts.seed_players
+
+# Spiel starten (Store 'influx' wird automatisch gewählt)
+python main.py
+```
+
+### Entwicklung mit lokalem Mock-Server
 
 ```bash
 # Mock-API-Server in einem zweiten Terminal
 python -m server.mock_api
 
-# Spiel mit RFID-Reader und API
-python main.py --api http://localhost:5000
+# Spiel mit RFID-Reader und lokalem HTTP-Mock
+python main.py --store api --api http://localhost:5000
 ```
 
 ### Offline-Modus (ohne RFID, ohne API)
@@ -143,14 +154,72 @@ Knopf für die komplette Einsatz-Bedienung.
 Der RFID-Chip wird beim Auflegen automatisch gelesen. Im Mock-Modus
 kann mit `1`, `2`, `3` ein Test-Chip simuliert werden.
 
-## API
+## Guthaben-Datenbank
 
-Der Client erwartet folgende Endpunkte:
+Es gibt drei mögliche Backends für das Guthaben, auswählbar über
+`--store`:
+
+| Backend            | Wofür                                          |
+|--------------------|--------------------------------------------------|
+| `influx` (Default) | **InfluxDB 2.x / InfluxDB Cloud** - Produktiv    |
+| `api`              | HTTP-Mock (`server/mock_api.py`) für Entwicklung |
+| `local`            | In-Memory, kein Server - reines Offline-Testen  |
+
+Ohne Argument wählt die Anwendung `influx`, wenn eine `.env`-Datei mit
+gültigen Zugangsdaten existiert, sonst `api`. `--offline` ist die
+Kurzform für `--store local`.
+
+### InfluxDB einrichten (nur einmal)
+
+1. Kopiere `.env.example` nach `.env` und trage die vier Werte ein, die
+   ihr aus dem InfluxDB-Portal bekommen habt:
+
+   ```bash
+   cp .env.example .env
+   # dann .env in einem Editor öffnen:
+   #   INFLUX_URL       = <URL des InfluxDB-Servers>
+   #   INFLUX_ORG_ID    = <Organisations-ID>
+   #   INFLUX_BUCKET    = <Bucket-Name>
+   #   INFLUX_BUCKET_ID = <Bucket-ID>
+   #   INFLUX_TOKEN     = <API-Token mit Read+Write auf dem Bucket>
+   ```
+
+2. Die drei Test-Spieler (Alice, Bob, Charlie) einmalig in die Datenbank
+   schreiben:
+
+   ```bash
+   python -m scripts.seed_players
+   ```
+
+3. Spiel wie gewohnt starten:
+
+   ```bash
+   python main.py
+   ```
+
+`.env` ist über `.gitignore` vom Commit ausgeschlossen - die Zugangsdaten
+bleiben also lokal.
+
+### Datenmodell in InfluxDB
+
+Jede Guthaben-Änderung wird als eigener Datenpunkt geschrieben, so dass
+in InfluxDB automatisch ein komplettes Buchungsjournal entsteht:
+
+```
+measurement: wallet
+  tags:   rfid, name
+  fields: balance
+```
+
+Der aktuelle Kontostand eines Spielers ist der Wert des letzten Punkts
+mit passendem `rfid`-Tag.
+
+### HTTP-API-Backend (Entwicklung)
+
+Der Client erwartet folgende Endpunkte, die vom Mock-Server implementiert
+sind:
 
 | Methode | Pfad                       | Beschreibung                       |
 |---------|----------------------------|------------------------------------|
 | GET     | `/players/<rfid_uid>`      | Liefert `{name, balance}`          |
 | POST    | `/players/<rfid_uid>/balance` | Body `{delta: int}` – verändert Guthaben |
-
-Der mitgelieferte Mock-Server (`server/mock_api.py`) implementiert beides
-gegen eine SQLite-Datenbank.

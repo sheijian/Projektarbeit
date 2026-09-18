@@ -40,12 +40,17 @@ log = logging.getLogger("blackjack")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Blackjack-Automat")
     p.add_argument(
+        "--store", choices=("auto", "influx", "api", "local"), default="auto",
+        help="Guthaben-Backend. 'auto' nimmt Influx (wenn .env konfiguriert), "
+             "sonst api. 'local' = In-Memory (Offline-Modus).",
+    )
+    p.add_argument(
         "--api", default=DEFAULT_API_URL,
-        help="Basis-URL der Guthaben-API (nur ohne --offline)",
+        help="Basis-URL der Guthaben-API (nur mit --store api)",
     )
     p.add_argument(
         "--offline", action="store_true",
-        help="Weder API noch RFID nutzen - Spieler wird lokal verwaltet.",
+        help="Kurzform für --store local: weder API/DB noch RFID nutzen.",
     )
     p.add_argument(
         "--auto-login", metavar="NAME", default="Alice",
@@ -95,11 +100,33 @@ class App:
 
     # ------------------------------------------------------------------
     def _build_store(self, args: argparse.Namespace) -> PlayerStore:
-        if args.offline:
+        # --offline ist die Kurzform für --store local.
+        store_kind = "local" if args.offline else args.store
+
+        if store_kind == "auto":
+            store_kind = self._auto_store_kind()
+
+        if store_kind == "local":
             log.info("Store: LocalPlayerStore (Offline-Modus)")
             return LocalPlayerStore()
+
+        if store_kind == "influx":
+            from blackjack.influx_store import InfluxPlayerStore
+            log.info("Store: InfluxPlayerStore")
+            return InfluxPlayerStore()
+
         log.info("Store: BalanceAPI (%s)", args.api)
         return BalanceAPI(args.api)
+
+    def _auto_store_kind(self) -> str:
+        """Nimmt Influx wenn .env konfiguriert ist, sonst api."""
+        try:
+            from blackjack.db_config import INFLUX
+            if INFLUX.is_configured:
+                return "influx"
+        except Exception:
+            pass
+        return "api"
 
     # ------------------------------------------------------------------
     def run(self) -> int:

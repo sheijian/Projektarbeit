@@ -1,6 +1,8 @@
 pygame>=2.5
 requests>=2.31
 Flask>=3.0
+influxdb-client>=1.40
+python-dotenv>=1.0
 # Nur auf dem Raspberry Pi nötig:
 # RPi.GPIO
 # mfrc522
