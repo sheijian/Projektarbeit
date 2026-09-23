@@ -154,6 +154,26 @@ Knopf für die komplette Einsatz-Bedienung.
 Der RFID-Chip wird beim Auflegen automatisch gelesen. Im Mock-Modus
 kann mit `1`, `2`, `3` ein Test-Chip simuliert werden.
 
+### RFID über einen HTTP-Test-Server
+
+Wenn der RFID-Leser nicht direkt am Pi hängt, sondern über eine kleine
+Test-Webseite im Netz erreichbar ist (z. B. `http://10.0.244.31/status`),
+gib die URL beim Start mit `--rfid-url` an:
+
+```bash
+python main.py --rfid-url http://10.0.244.31/status
+```
+
+Das Spiel pollt die Adresse alle 0,5 Sekunden und akzeptiert dabei alle
+üblichen Antwortformate:
+
+* JSON mit einem der Schlüssel `uid`, `id`, `card_id`, `rfid`, `tag`
+  oder `value` (z. B. `{"uid": "0416AC12"}`)
+* JSON mit `{"status": "no_card"}` → gilt als "kein Chip aufgelegt"
+* reiner Text, der eine Hex-UID enthält
+  (`0416AC12`, `04-16-AC-12`, `AA:BB:CC:DD` …)
+* HTML mit einer irgendwo enthaltenen Hex-UID
+
 ## Guthaben-Datenbank
 
 Es gibt drei mögliche Backends für das Guthaben, auswählbar über

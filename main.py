@@ -29,7 +29,7 @@ from blackjack.buttons import ButtonHandler
 from blackjack.config import DEFAULT_API_URL, DEFAULT_BET, DEFAULT_MIN_BET
 from blackjack.game import Game, Player
 from blackjack.gui import BlackjackGUI
-from blackjack.rfid import RFIDReader
+from blackjack.rfid import HTTPRFIDReader, RFIDReader
 from blackjack.store import LocalPlayerStore, PlayerNotFound, PlayerStore, StoreError
 
 
@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="Eingabequelle für die Arcade-Taster (Default: auto - USB, dann GPIO)",
     )
     p.add_argument("--no-rfid", action="store_true", help="MFRC522-Modul ignorieren")
+    p.add_argument(
+        "--rfid-url", metavar="URL", default=None,
+        help="HTTP-Adresse eines RFID-Test-Servers, z. B. "
+             "http://10.0.244.31/status. Wenn gesetzt, wird die Karten-UID "
+             "über HTTP-Polling geholt statt über den MFRC522-Reader.",
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
 
@@ -88,11 +94,13 @@ class App:
         self.buttons = ButtonHandler(mode=args.input)
 
         # Im Offline-Modus mit Auto-Login brauchen wir gar keinen RFID-Reader,
-        # sonst starten wir ihn (mit Hardware oder als Mock).
+        # sonst starten wir ihn (HTTP-Test-Server, Hardware oder Mock).
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
             self.rfid = None
             self._auto_login_pending = args.auto_login
+        elif args.rfid_url:
+            self.rfid = HTTPRFIDReader(args.rfid_url)
         else:
             self.rfid = RFIDReader(
                 use_hardware=None if not args.no_rfid else False,
