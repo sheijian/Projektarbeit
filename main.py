@@ -53,6 +53,16 @@ def parse_args() -> argparse.Namespace:
         help="Kurzform für --store local: weder API/DB noch RFID nutzen.",
     )
     p.add_argument(
+        "--auto-register", action="store_true",
+        help="Nur mit --store local: unbekannte RFID-UIDs werden als "
+             "frischer Gast mit Startguthaben angelegt. Praktisch für "
+             "Reader-Tests, wenn die richtige DB noch nicht angebunden ist.",
+    )
+    p.add_argument(
+        "--auto-register-balance", type=int, default=500,
+        help="Startguthaben für auto-registrierte Gäste (Default 500).",
+    )
+    p.add_argument(
         "--auto-login", metavar="NAME", default="Alice",
         help="Im Offline-Modus: sofort mit diesem Spieler anmelden "
              "(Default: Alice). Mit --no-auto-login deaktivieren.",
@@ -115,8 +125,14 @@ class App:
             store_kind = self._auto_store_kind()
 
         if store_kind == "local":
-            log.info("Store: LocalPlayerStore (Offline-Modus)")
-            return LocalPlayerStore()
+            log.info(
+                "Store: LocalPlayerStore (Offline-Modus, auto_register=%s)",
+                args.auto_register,
+            )
+            return LocalPlayerStore(
+                auto_register=args.auto_register,
+                auto_balance=args.auto_register_balance,
+            )
 
         if store_kind == "influx":
             from blackjack.influx_store import InfluxPlayerStore

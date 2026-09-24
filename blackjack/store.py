@@ -48,17 +48,35 @@ class LocalPlayerStore:
         (MOCK_RFID_KEYS["3"], "Charlie", 1000),
     )
 
-    def __init__(self, players: Iterable[tuple[str, str, int]] | None = None) -> None:
+    def __init__(
+        self,
+        players: Iterable[tuple[str, str, int]] | None = None,
+        auto_register: bool = False,
+        auto_balance: int = 500,
+    ) -> None:
         self._players: Dict[str, Player] = {}
         for rfid, name, balance in (players or self.DEFAULT_PLAYERS):
             self._players[rfid] = Player(rfid=rfid, name=name, balance=balance)
+        self._auto_register = auto_register
+        self._auto_balance = auto_balance
 
     # ------------------------------------------------------------------
     def get_player(self, rfid_uid: str) -> Player:
-        try:
-            p = self._players[rfid_uid]
-        except KeyError as e:
-            raise PlayerNotFound(rfid_uid) from e
+        p = self._players.get(rfid_uid)
+        if p is None:
+            if self._auto_register:
+                p = Player(
+                    rfid=rfid_uid,
+                    name=f"Gast-{rfid_uid[:8]}",
+                    balance=self._auto_balance,
+                )
+                self._players[rfid_uid] = p
+                log.info(
+                    "Auto-registriere unbekannten Chip %s mit Guthaben %d",
+                    rfid_uid, self._auto_balance,
+                )
+            else:
+                raise PlayerNotFound(rfid_uid)
         # Kopie zurückgeben, damit externe Modifikationen nicht durchsickern.
         return Player(rfid=p.rfid, name=p.name, balance=p.balance)
 

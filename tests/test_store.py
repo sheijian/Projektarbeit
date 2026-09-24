@@ -57,6 +57,29 @@ def test_apply_delta_unknown_returns_none():
     assert store.apply_delta("nope", -5) is None
 
 
+def test_auto_register_creates_unknown_player_on_lookup():
+    store = LocalPlayerStore(auto_register=True, auto_balance=300)
+    uid = "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+    player = store.get_player(uid)
+    assert player.rfid == uid
+    assert player.balance == 300
+    assert player.name.startswith("Gast-")
+    # Zweiter Aufruf liefert denselben Spieler, kein neues Guthaben.
+    store.apply_delta(uid, -50)
+    again = store.get_player(uid)
+    assert again.balance == 250
+
+
+def test_auto_register_disabled_still_raises():
+    store = LocalPlayerStore(auto_register=False)
+    try:
+        store.get_player("unknown")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("PlayerNotFound erwartet")
+
+
 def test_game_writes_through_to_store():
     """Realer Ablauf: Game -> on_balance_change -> LocalPlayerStore."""
     store = LocalPlayerStore()
