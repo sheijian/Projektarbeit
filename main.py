@@ -40,8 +40,8 @@ log = logging.getLogger("blackjack")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Blackjack-Automat")
     p.add_argument(
-        "--store", choices=("auto", "influx", "api", "local"), default="auto",
-        help="Guthaben-Backend. 'auto' nimmt Influx (wenn .env konfiguriert), "
+        "--store", choices=("auto", "ppmaster", "api", "local"), default="auto",
+        help="Guthaben-Backend. 'auto' nimmt ppmaster (wenn .env konfiguriert), "
              "sonst api. 'local' = In-Memory (Offline-Modus).",
     )
     p.add_argument(
@@ -134,20 +134,20 @@ class App:
                 auto_balance=args.auto_register_balance,
             )
 
-        if store_kind == "influx":
-            from blackjack.influx_store import InfluxPlayerStore
-            log.info("Store: InfluxPlayerStore")
-            return InfluxPlayerStore()
+        if store_kind == "ppmaster":
+            from blackjack.ppmaster_store import PPMasterStore
+            log.info("Store: PPMasterStore")
+            return PPMasterStore()
 
         log.info("Store: BalanceAPI (%s)", args.api)
         return BalanceAPI(args.api)
 
     def _auto_store_kind(self) -> str:
-        """Nimmt Influx wenn .env konfiguriert ist, sonst api."""
+        """Nimmt PPMaster wenn .env konfiguriert ist, sonst api."""
         try:
             from blackjack.db_config import INFLUX
             if INFLUX.is_configured:
-                return "influx"
+                return "ppmaster"
         except Exception:
             pass
         return "api"
@@ -196,17 +196,26 @@ class App:
                 return
             if uid is None:
                 log.info("RFID entfernt")
+                self._finalize_current_session()
                 self.game.logout()
             else:
                 self._login_by_uid(uid)
 
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
+
+        # Wenn der HTTP-Reader einen Anzeigenamen mitliefert, ist der die
+        # eigentliche Kennung im PPMaster-Bucket (Tag rfidTag=<name>).
+        hint = None
+        if isinstance(self.rfid, HTTPRFIDReader):
+            hint = self.rfid.get_name_hint(uid)
+        lookup_key = hint if hint else uid
+
         try:
-            player = self.store.get_player(uid)
+            player = self.store.get_player(lookup_key)
         except PlayerNotFound:
             self.game.logout()
-            self.game.message = f"Unbekannter Chip: {uid}"
+            self.game.message = f"Unbekannter Chip: {lookup_key}"
             return
         except (APIError, StoreError) as e:
             log.warning("Store-Fehler: %s", e)
@@ -214,15 +223,29 @@ class App:
             self.game.message = "Datenbank nicht erreichbar"
             return
 
-        # HTTP-Reader kann einen Anzeigenamen (username) mitliefern -
-        # der hat gegenüber generischen Namen wie "Gast-..." Vorrang.
-        hint = None
-        if isinstance(self.rfid, HTTPRFIDReader):
-            hint = self.rfid.get_name_hint(uid)
+        # Anzeigename im HUD ist der lesbare Name, falls vorhanden.
         if hint:
             player.name = hint
 
         self.game.login(player, default_bet=self.args.default_bet)
+
+    def _finalize_current_session(self) -> None:
+        """Schreibt am Ende einer Session Endscore + Winrate in den Bucket."""
+        if self.game.player is None:
+            return
+        if not hasattr(self.store, "finalize_session"):
+            return
+        if self.game.session_plays <= 0:
+            return
+        try:
+            self.store.finalize_session(   # type: ignore[attr-defined]
+                self.game.player.rfid,
+                self.game.player.balance,
+                self.game.session_wins,
+                self.game.session_plays,
+            )
+        except Exception as e:   # nichts darf den Logout blockieren
+            log.warning("finalize_session fehlgeschlagen: %s", e)
 
     def _auto_login(self, name: str) -> None:
         """Offline-Modus: Spieler ohne RFID sofort anmelden."""
@@ -269,6 +292,9 @@ class App:
 
     # ------------------------------------------------------------------
     def _shutdown(self) -> None:
+        # Letzte Session noch persistieren, falls noch jemand eingeloggt ist.
+        self._finalize_current_session()
+
         try:
             self.buttons.close()
         except Exception:  # pragma: no cover
@@ -276,6 +302,13 @@ class App:
         if self.rfid is not None:
             try:
                 self.rfid.close()
+            except Exception:  # pragma: no cover
+                pass
+        # Store hat evtl. eigene Ressourcen (HTTP-Session).
+        close_fn = getattr(self.store, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
             except Exception:  # pragma: no cover
                 pass
         self.gui.close()

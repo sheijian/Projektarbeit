@@ -176,63 +176,48 @@ Das Spiel pollt die Adresse alle 0,5 Sekunden und akzeptiert dabei alle
 
 ## Guthaben-Datenbank
 
-Es gibt drei mögliche Backends für das Guthaben, auswählbar über
-`--store`:
+Es gibt drei Backends, auswählbar über `--store`:
 
-| Backend            | Wofür                                          |
-|--------------------|--------------------------------------------------|
-| `influx` (Default) | **InfluxDB 2.x / InfluxDB Cloud** - Produktiv    |
-| `api`              | HTTP-Mock (`server/mock_api.py`) für Entwicklung |
-| `local`            | In-Memory, kein Server - reines Offline-Testen  |
+| Backend               | Wofür                                             |
+|-----------------------|----------------------------------------------------|
+| `ppmaster` (Default)  | **Gemeinsamer InfluxDB-Bucket** aller Stationen    |
+| `api`                 | HTTP-Mock (`server/mock_api.py`) für Entwicklung  |
+| `local`               | In-Memory, kein Server - reines Offline-Testen     |
 
-Ohne Argument wählt die Anwendung `influx`, wenn eine `.env`-Datei mit
-gültigen Zugangsdaten existiert, sonst `api`. `--offline` ist die
+Ohne Argument wählt die Anwendung `ppmaster`, wenn eine `.env`-Datei
+mit gültigen Zugangsdaten existiert, sonst `api`. `--offline` ist die
 Kurzform für `--store local`.
 
-### InfluxDB einrichten (nur einmal)
+### PPMaster-Bucket
 
-1. Kopiere `.env.example` nach `.env` und trage die vier Werte ein, die
-   ihr aus dem InfluxDB-Portal bekommen habt:
-
-   ```bash
-   cp .env.example .env
-   # dann .env in einem Editor öffnen:
-   #   INFLUX_URL       = <URL des InfluxDB-Servers>
-   #   INFLUX_ORG_ID    = <Organisations-ID>
-   #   INFLUX_BUCKET    = <Bucket-Name>
-   #   INFLUX_BUCKET_ID = <Bucket-ID>
-   #   INFLUX_TOKEN     = <API-Token mit Read+Write auf dem Bucket>
-   ```
-
-2. Die drei Test-Spieler (Alice, Bob, Charlie) einmalig in die Datenbank
-   schreiben:
-
-   ```bash
-   python -m scripts.seed_players
-   ```
-
-3. Spiel wie gewohnt starten:
-
-   ```bash
-   python main.py
-   ```
-
-`.env` ist über `.gitignore` vom Commit ausgeschlossen - die Zugangsdaten
-bleiben also lokal.
-
-### Datenmodell in InfluxDB
-
-Jede Guthaben-Änderung wird als eigener Datenpunkt geschrieben, so dass
-in InfluxDB automatisch ein komplettes Buchungsjournal entsteht:
+Beim Chip-Auflegen fragt die Anwendung die Summe aller `endscore`-
+Datenpunkte des Spielers **aus der letzten Stunde** ab - das ergibt das
+Startguthaben, das er von den anderen Stationen mitbringt. Am Ende der
+Session (Chip abheben oder Programm beenden) werden zwei neue
+Datenpunkte geschrieben:
 
 ```
-measurement: wallet
-  tags:   rfid, name
-  fields: balance
+endscore,rfidTag=<name> score=<netto-delta>     <timestamp_ms>
+winrate,rfidTag=<name>  winrate=<prozent>       <timestamp_ms>
 ```
 
-Der aktuelle Kontostand eines Spielers ist der Wert des letzten Punkts
-mit passendem `rfid`-Tag.
+Wichtig: gespeichert wird der **Netto-Delta** dieses Spieldurchlaufs
+(aktuelles Guthaben minus Startguthaben), nicht der neue Kontostand
+selbst - damit die Summe über alle Datenpunkte weiterhin das korrekte
+Guthaben ergibt und keine Punkte doppelt gezählt werden.
+
+### Einrichtung
+
+`.env.example` liegt bei; die tatsächliche `.env` wird von `.gitignore`
+ausgeschlossen. Zugangsdaten (URL/Org/Bucket/Tokens) trägt jeder lokal
+in `.env` ein. Danach startet man einfach:
+
+```bash
+python main.py --rfid-url http://10.0.244.31/status
+```
+
+Der Store meldet sich mit `PPMasterStore verbunden mit ...` im Log,
+sobald `.env` sinnvoll gefüllt ist.
 
 ### HTTP-API-Backend (Entwicklung)
 

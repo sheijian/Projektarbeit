@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -45,27 +44,35 @@ _load_env(_ROOT / ".env")
 @dataclass(frozen=True)
 class InfluxConfig:
     url: str
-    org_id: str
+    org: str
     bucket: str
     bucket_id: str
-    token: str
+    token_read: str
+    token_write: str
+    query_range: str = "-1h"
 
     @property
     def is_configured(self) -> bool:
-        # Alle Werte müssen gesetzt und nicht Platzhalter sein.
-        for v in (self.url, self.org_id, self.bucket, self.bucket_id, self.token):
-            if not v or v.startswith("YOUR_"):
+        # URL/Org/Bucket + mindestens ein Token müssen sinnvoll gesetzt sein.
+        for v in (self.url, self.org, self.bucket, self.token_read, self.token_write):
+            if not v or v.startswith(("<", "YOUR_")):
                 return False
         return True
 
 
 def load_influx_config() -> InfluxConfig:
+    # Ein einziger Token (INFLUX_TOKEN) wird als Fallback für beide
+    # Rollen benutzt, falls jemand nur einen gesetzt hat.
+    generic_token = os.environ.get("INFLUX_TOKEN", "")
     return InfluxConfig(
         url=os.environ.get("INFLUX_URL", ""),
-        org_id=os.environ.get("INFLUX_ORG_ID", ""),
+        # ORG akzeptiert Name oder ID; INFLUX_ORG_ID bleibt als Fallback.
+        org=os.environ.get("INFLUX_ORG") or os.environ.get("INFLUX_ORG_ID", ""),
         bucket=os.environ.get("INFLUX_BUCKET", ""),
         bucket_id=os.environ.get("INFLUX_BUCKET_ID", ""),
-        token=os.environ.get("INFLUX_TOKEN", ""),
+        token_read=os.environ.get("INFLUX_TOKEN_READ") or generic_token,
+        token_write=os.environ.get("INFLUX_TOKEN_WRITE") or generic_token,
+        query_range=os.environ.get("INFLUX_QUERY_RANGE", "-1h"),
     )
 
 

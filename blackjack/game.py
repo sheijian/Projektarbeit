@@ -95,6 +95,10 @@ class Game:
         self.on_balance_change = on_balance_change
         # Für die Deal-Animation: nächstmöglicher Aufdeck-Zeitpunkt.
         self._next_deal_at: float = 0.0
+        # Session-Statistik: wieviele Runden hat der aktuelle Spieler
+        # gespielt und wieviele davon mit Netto-Gewinn abgeschlossen.
+        self.session_plays: int = 0
+        self.session_wins: int = 0
 
     # ------------------------------------------------------------------
     # Spieler-Session
@@ -106,6 +110,8 @@ class Game:
         self.dealer = Hand()
         self.active_hand = 0
         self.results = []
+        self.session_plays = 0
+        self.session_wins = 0
         if player.balance < self.min_bet:
             self.state = State.NO_PLAYER
             self.message = "Guthaben zu niedrig"
@@ -119,6 +125,8 @@ class Game:
         self.dealer = Hand()
         self.state = State.NO_PLAYER
         self.message = "Bitte RFID-Chip auflegen"
+        self.session_plays = 0
+        self.session_wins = 0
 
     # ------------------------------------------------------------------
     # Runden-Start
@@ -338,6 +346,11 @@ class Game:
             self.results.append(RoundResult(idx, outcome, hand.bet, payout))
             if payout > 0:
                 self._change_balance(payout)
+
+        # Session-Statistik: eine Runde weiter, Sieg bei Netto-Delta > 0.
+        self.session_plays += 1
+        if sum(r.delta for r in self.results) > 0:
+            self.session_wins += 1
 
         self.state = State.ROUND_OVER
         self.message = self._summary_message()
