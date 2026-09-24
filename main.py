@@ -213,6 +213,15 @@ class App:
             self.game.logout()
             self.game.message = "Datenbank nicht erreichbar"
             return
+
+        # HTTP-Reader kann einen Anzeigenamen (username) mitliefern -
+        # der hat gegenüber generischen Namen wie "Gast-..." Vorrang.
+        hint = None
+        if isinstance(self.rfid, HTTPRFIDReader):
+            hint = self.rfid.get_name_hint(uid)
+        if hint:
+            player.name = hint
+
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _auto_login(self, name: str) -> None:

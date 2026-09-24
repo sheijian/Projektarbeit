@@ -150,56 +150,64 @@ _ID_KEYS = (
     "user_id", "userid", "uid", "id",
     "card_id", "cardid", "rfid", "tag", "value",
 )
+# Bekannte Schl\u00fcssel, unter denen der Test-Server den Anzeigenamen liefert.
+_NAME_KEYS = ("username", "user_name", "name", "display_name", "player_name")
 
 
-def _extract_uid(payload) -> Optional[str]:
-    """Findet die User- oder Karten-UID in einer HTTP-Antwort.
+def _extract_scan(payload) -> tuple[Optional[str], Optional[str]]:
+    """Extrahiert (uid, name) aus der HTTP-Antwort.
 
-    Unterst\u00fctzt:
-
-    * JSON mit einem der \u00fcblichen Schl\u00fcssel (``user_id``, ``uid``,
-      ``id``, ``card_id``, ``rfid`` \u2026) sowie den Statusfeldern
-      ``logged_in`` / ``logged_out``.
-    * Plain-Text, der nur aus einer UUID oder Hex-UID besteht.
-    * HTML/Text, in dem irgendwo eine UUID oder Hex-UID vorkommt.
-
-    UUIDs (36-stellig mit Bindestrichen) werden **unver\u00e4ndert** in
-    Kleinbuchstaben zur\u00fcckgegeben, damit sie zum Format eures Test-Servers
-    und der Datenbank passen. Hex-RFID-UIDs werden weiterhin von Trennern
-    befreit und in Gro\u00dfbuchstaben normalisiert.
+    ``name`` ist der optionale Anzeigename (z.\u00a0B. ``username`` aus dem
+    Test-Server-JSON) und kann ``None`` sein. UUIDs bleiben mit Bindestrichen
+    und Kleinbuchstaben erhalten, Hex-RFID-UIDs werden normalisiert (Trenner
+    weg, Gro\u00dfbuchstaben).
     """
     # 1) JSON
     if isinstance(payload, dict):
         status = str(payload.get("status", "")).lower()
         if status in _NEGATIVE_STATUS:
-            return None
-        # Wenn ein bekannter Positiv-Status ODER \u00fcberhaupt kein Status
-        # gesetzt ist, versuchen wir die ID zu extrahieren.
+            return None, None
         if status and status not in _POSITIVE_STATUS:
             log.debug("HTTP-RFID: unbekannter status=%r, versuche trotzdem ID", status)
+
+        uid: Optional[str] = None
         for key in _ID_KEYS:
             if key in payload and payload[key] not in (None, "", 0):
-                return _normalize_id(str(payload[key]))
-        return None
+                uid = _normalize_id(str(payload[key]))
+                break
+
+        name: Optional[str] = None
+        for key in _NAME_KEYS:
+            if key in payload and payload[key] not in (None, ""):
+                name = str(payload[key]).strip() or None
+                if name:
+                    break
+
+        return uid, name
 
     # 2) Text
     text = str(payload).strip()
     if not text:
-        return None
+        return None, None
 
     m = _UUID_RE.search(text)
     if m:
-        return m.group(0).lower()
+        return m.group(0).lower(), None
 
-    # Als N\u00e4chstes: reiner Hex-Text ohne Trenner - direkt akzeptieren.
     normalized = _normalize_uid_hex(text)
     if normalized and all(c in "0123456789ABCDEF" for c in normalized):
-        return normalized
+        return normalized, None
 
     m = _UID_RE.search(text)
     if m:
-        return _normalize_uid_hex(m.group(1))
-    return None
+        return _normalize_uid_hex(m.group(1)), None
+    return None, None
+
+
+def _extract_uid(payload) -> Optional[str]:
+    """Backwards-Compat: liefert nur die UID (ohne Namen)."""
+    uid, _name = _extract_scan(payload)
+    return uid
 
 
 def _looks_like_uuid(value: str) -> bool:
@@ -242,6 +250,8 @@ class HTTPRFIDReader:
         self._stop = threading.Event()
         self._last_uid: Optional[str] = None
         self._last_seen: float = 0.0
+        # Von UID auf zuletzt gesehenen Anzeigenamen (aus dem username-Feld).
+        self._names: dict[str, str] = {}
 
         self._session = requests.Session()
         self._thread = threading.Thread(
@@ -270,9 +280,18 @@ class HTTPRFIDReader:
         # Erst JSON versuchen, sonst als Text weiterreichen.
         try:
             data = r.json()
-            return _extract_uid(data)
+            uid, name = _extract_scan(data)
         except ValueError:
-            return _extract_uid(r.text)
+            uid, name = _extract_scan(r.text)
+
+        if uid and name:
+            self._names[uid] = name
+        return uid
+
+    def get_name_hint(self, uid: str) -> Optional[str]:
+        """Zuletzt gesehener Anzeigename für diese UID (falls der
+        Test-Server einen `username` mitgeliefert hat)."""
+        return self._names.get(uid)
 
     def _process_uid(self, uid: Optional[str]) -> None:
         now = time.monotonic()

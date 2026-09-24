@@ -1,6 +1,6 @@
 """Tests für den UID-Extractor des HTTP-RFID-Readers."""
 
-from blackjack.rfid import _extract_uid, _normalize_id, _normalize_uid
+from blackjack.rfid import _extract_scan, _extract_uid, _normalize_id, _normalize_uid
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +58,44 @@ def test_uuid_in_plain_text():
 def test_uuid_in_html():
     html = "<p>Angemeldet: b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca</p>"
     assert _extract_uid(html) == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+
+
+# ---------------------------------------------------------------------------
+# Anzeigename (username) mitextrahieren
+# ---------------------------------------------------------------------------
+def test_extract_scan_returns_uid_and_username():
+    payload = {
+        "status": "logged_in",
+        "user_id": "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca",
+        "username": "Jonathan",
+    }
+    uid, name = _extract_scan(payload)
+    assert uid == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+    assert name == "Jonathan"
+
+
+def test_extract_scan_alternative_name_keys():
+    for key in ("user_name", "name", "display_name", "player_name"):
+        payload = {"user_id": "abc-def", key: "Alice"}
+        _uid, name = _extract_scan(payload)
+        assert name == "Alice", f"expected Alice via key {key}"
+
+
+def test_extract_scan_no_name_present():
+    payload = {"user_id": "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"}
+    uid, name = _extract_scan(payload)
+    assert uid == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+    assert name is None
+
+
+def test_extract_scan_text_has_no_name():
+    uid, name = _extract_scan("b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca")
+    assert uid == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+    assert name is None
+
+
+def test_extract_scan_status_no_card():
+    assert _extract_scan({"status": "logged_out"}) == (None, None)
 
 
 def test_json_empty_uid():
