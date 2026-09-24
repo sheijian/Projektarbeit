@@ -1,6 +1,6 @@
 """Tests für den UID-Extractor des HTTP-RFID-Readers."""
 
-from blackjack.rfid import _extract_uid, _normalize_uid
+from blackjack.rfid import _extract_uid, _normalize_id, _normalize_uid
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +25,39 @@ def test_json_with_colons_and_lowercase():
 def test_json_status_no_card():
     assert _extract_uid({"status": "no_card"}) is None
     assert _extract_uid({"status": "idle"}) is None
+    assert _extract_uid({"status": "logged_out"}) is None
+
+
+# ---------------------------------------------------------------------------
+# Antwortformat des tatsächlichen Test-Servers
+# ---------------------------------------------------------------------------
+def test_actual_test_server_response():
+    """Genau das Format, das der Test-Server 10.0.244.31 liefert."""
+    payload = {
+        "status": "logged_in",
+        "user_id": "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca",
+        "username": "Jonathan",
+        "run_id": "5",
+        "time": 70,
+    }
+    assert _extract_uid(payload) == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+
+
+def test_uuid_keeps_dashes_and_lowercase():
+    """UUIDs dürfen NICHT normalisiert werden - sonst passt der Tag in
+    InfluxDB nicht mehr."""
+    payload = {"user_id": "B807DEE3-A666-4AA6-B5BD-F2D1EA0B7DCA"}
+    assert _extract_uid(payload) == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+
+
+def test_uuid_in_plain_text():
+    text = "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+    assert _extract_uid(text) == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
+
+
+def test_uuid_in_html():
+    html = "<p>Angemeldet: b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca</p>"
+    assert _extract_uid(html) == "b807dee3-a666-4aa6-b5bd-f2d1ea0b7dca"
 
 
 def test_json_empty_uid():

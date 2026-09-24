@@ -123,34 +123,63 @@ class RFIDReader:
 # ---------------------------------------------------------------------------
 # HTTP-basierter RFID-Reader
 # ---------------------------------------------------------------------------
-# Reguladrer Ausdruck, mit dem wir Kandidaten f\u00fcr eine RFID-UID aus
-# Freitext filtern. UIDs bestehen \u00fcblicherweise aus mindestens 6 Hex-
-# Zeichen. Wir akzeptieren optional Bindestriche/Doppelpunkte/Leerzeichen
-# als Trenner und stripen sie sp\u00e4ter.
+# Hex-RFID-UID (mind. 6 Zeichen) mit optionalen Trennern - Bindestriche
+# werden hier entfernt.
 _UID_RE = re.compile(r"([0-9A-Fa-f](?:[\s:\-]?[0-9A-Fa-f]){5,31})")
+# UUID (8-4-4-4-12) - wird als "User-ID" so \u00fcbernommen, wie sie ist.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+# JSON-Statuswerte, die als "keine Karte aufgelegt / abgemeldet" gelten.
+_NEGATIVE_STATUS = {
+    "none", "no_card", "empty", "idle", "logged_out", "loggedout",
+    "unknown", "waiting",
+}
+# JSON-Statuswerte, die als "Karte aufgelegt / eingeloggt" gelten und die
+# Extraktion des ID-Feldes ausl\u00f6sen.
+_POSITIVE_STATUS = {
+    "logged_in", "loggedin", "ok", "success", "present", "detected", "active",
+}
+
+
+# Reihenfolge z\u00e4hlt: das erste passende Feld gewinnt.
+_ID_KEYS = (
+    "user_id", "userid", "uid", "id",
+    "card_id", "cardid", "rfid", "tag", "value",
+)
 
 
 def _extract_uid(payload) -> Optional[str]:
-    """Findet eine RFID-UID in einer HTTP-Antwort.
+    """Findet die User- oder Karten-UID in einer HTTP-Antwort.
 
-    Unterst\u00fctzt die \u00fcblichen Formate:
+    Unterst\u00fctzt:
 
-    * JSON mit einem der Schl\u00fcssel ``uid`` / ``id`` / ``card_id`` /
-      ``rfid`` / ``tag`` / ``value``
-    * Plain-Text, der nur aus einer Hex-UID besteht
-    * HTML/Text, in dem irgendwo eine Hex-UID vorkommt
+    * JSON mit einem der \u00fcblichen Schl\u00fcssel (``user_id``, ``uid``,
+      ``id``, ``card_id``, ``rfid`` \u2026) sowie den Statusfeldern
+      ``logged_in`` / ``logged_out``.
+    * Plain-Text, der nur aus einer UUID oder Hex-UID besteht.
+    * HTML/Text, in dem irgendwo eine UUID oder Hex-UID vorkommt.
 
-    Liefert die UID in Gro\u00dfbuchstaben ohne Trennzeichen oder ``None``.
+    UUIDs (36-stellig mit Bindestrichen) werden **unver\u00e4ndert** in
+    Kleinbuchstaben zur\u00fcckgegeben, damit sie zum Format eures Test-Servers
+    und der Datenbank passen. Hex-RFID-UIDs werden weiterhin von Trennern
+    befreit und in Gro\u00dfbuchstaben normalisiert.
     """
     # 1) JSON
     if isinstance(payload, dict):
-        # Erst die \u00fcblichen "kein Chip"-Marker abfangen.
         status = str(payload.get("status", "")).lower()
-        if status in ("none", "no_card", "empty", "idle"):
+        if status in _NEGATIVE_STATUS:
             return None
-        for key in ("uid", "id", "card_id", "cardid", "rfid", "tag", "value"):
+        # Wenn ein bekannter Positiv-Status ODER \u00fcberhaupt kein Status
+        # gesetzt ist, versuchen wir die ID zu extrahieren.
+        if status and status not in _POSITIVE_STATUS:
+            log.debug("HTTP-RFID: unbekannter status=%r, versuche trotzdem ID", status)
+        for key in _ID_KEYS:
             if key in payload and payload[key] not in (None, "", 0):
-                return _normalize_uid(str(payload[key]))
+                return _normalize_id(str(payload[key]))
         return None
 
     # 2) Text
@@ -158,20 +187,40 @@ def _extract_uid(payload) -> Optional[str]:
     if not text:
         return None
 
-    # Ganz einfacher Fall: die Response ist nur die UID.
-    normalized = _normalize_uid(text)
+    m = _UUID_RE.search(text)
+    if m:
+        return m.group(0).lower()
+
+    # Als N\u00e4chstes: reiner Hex-Text ohne Trenner - direkt akzeptieren.
+    normalized = _normalize_uid_hex(text)
     if normalized and all(c in "0123456789ABCDEF" for c in normalized):
         return normalized
 
-    # Sonst per Regex im Text suchen (HTML, "UID: xx" etc.).
     m = _UID_RE.search(text)
     if m:
-        return _normalize_uid(m.group(1))
+        return _normalize_uid_hex(m.group(1))
     return None
 
 
-def _normalize_uid(raw: str) -> str:
+def _looks_like_uuid(value: str) -> bool:
+    return bool(_UUID_RE.fullmatch(value.strip()))
+
+
+def _normalize_id(raw: str) -> str:
+    """UUIDs bleiben (in Kleinbuchstaben) erhalten; alles andere wird als
+    Hex-UID behandelt und normalisiert."""
+    trimmed = raw.strip()
+    if _looks_like_uuid(trimmed):
+        return trimmed.lower()
+    return _normalize_uid_hex(trimmed)
+
+
+def _normalize_uid_hex(raw: str) -> str:
     return re.sub(r"[\s:\-]", "", raw).strip().upper()
+
+
+# Alias f\u00fcr Abw\u00e4rtskompatibilit\u00e4t (fr\u00fchere Tests / externer Code).
+_normalize_uid = _normalize_id
 
 
 class HTTPRFIDReader:
@@ -229,11 +278,13 @@ class HTTPRFIDReader:
         now = time.monotonic()
         if uid is None:
             if self._last_uid is not None and now - self._last_seen > self.IDLE_TIMEOUT:
+                log.info("HTTP-RFID: Karte %s entfernt", self._last_uid)
                 self._last_uid = None
                 self.events.put(None)
             return
         self._last_seen = now
         if uid != self._last_uid:
+            log.info("HTTP-RFID: neue ID %s", uid)
             self._last_uid = uid
             self.events.put(uid)
 
