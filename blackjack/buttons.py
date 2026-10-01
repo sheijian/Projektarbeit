@@ -1,17 +1,13 @@
-"""Arcade-Taster-Handler.
+"""Arcade-Taster-Handler (USB-Encoder + Tastatur-Fallback).
 
-Drei mögliche Eingabequellen:
+Der EG-STARTS-Encoder hängt per USB am Rechner und meldet sich als
+HID-Gamepad. Jeder Taster erzeugt in pygame ein ``JOYBUTTONDOWN``-Event.
+Die Zuordnung Button-Index → Aktion kommt aus `config.BUTTON_JOY`
+(gebildet aus `K_JOY_BUTTONS` + `K_ACTIONS`).
 
-* ``usb``      – der Zero-Delay-Encoder wird per USB als HID-Gamepad erkannt.
-                Jeder Taster meldet sich als Button-Down-Event in pygame
-                (``JOYBUTTONDOWN``). Das ist die Standardvariante für das
-                verwendete EG-STARTS-Board.
-* ``gpio``     – die Taster hängen direkt am 40-Pin-Header eines Raspberry Pi.
-                Benötigt ``RPi.GPIO`` und läuft nur auf dem Pi.
-* ``keyboard`` – reine Tastatur-Bedienung (Fallback für die Entwicklung).
-
-Im Modus ``auto`` (Default) wird automatisch die beste verfügbare Quelle
-gewählt: erst USB-Gamepad, dann GPIO, sonst Tastatur.
+Zusätzlich ist immer eine Tastatur-Steuerung verfügbar
+(H/S/D/P - siehe `config.KEYBOARD_FALLBACK`), damit das Spiel auch ohne
+Encoder bedient werden kann.
 """
 
 from __future__ import annotations
@@ -24,21 +20,13 @@ from typing import Dict, Optional
 
 import pygame
 
-from .config import BUTTON_JOY, BUTTON_PINS, JOY_INDEX, KEYBOARD_FALLBACK
+from .config import BUTTON_JOY, JOY_INDEX, KEYBOARD_FALLBACK
 
 log = logging.getLogger(__name__)
 
 
-try:
-    import RPi.GPIO as GPIO  # type: ignore
-    HAS_GPIO = True
-except Exception:   # ImportError oder RuntimeError außerhalb des Pi
-    GPIO = None      # type: ignore
-    HAS_GPIO = False
-
-
-InputMode = str    # "usb" | "gpio" | "keyboard" | "auto"
-VALID_MODES = ("auto", "usb", "gpio", "keyboard")
+InputMode = str    # "usb" | "keyboard" | "auto"
+VALID_MODES = ("auto", "usb", "keyboard")
 
 
 # ---------------------------------------------------------------------------
@@ -52,31 +40,27 @@ class ButtonHandler:
             raise ValueError(f"Ungültiger input-Modus: {mode}")
 
         self.events: "queue.Queue[str]" = queue.Queue()
-        self._last_press: Dict[str, float] = {a: 0.0 for a in BUTTON_PINS}
+        self._last_press: Dict[str, float] = {a: 0.0 for a in BUTTON_JOY}
         self._stop = threading.Event()
 
-        # Tastatur-Belegung ist immer aktiv (auch parallel zu USB/GPIO).
+        # Tastatur-Belegung ist immer aktiv.
         self._key_map = {
             self._to_pygame_key(v): action
             for action, v in KEYBOARD_FALLBACK.items()
         }
 
         self._mode = self._resolve_mode(mode)
-
-        # Joystick: von USB-Modus initialisiert und in pygame-Events verarbeitet.
         self._joy: Optional[pygame.joystick.Joystick] = None
         self._joy_map: Dict[int, str] = {}
 
         if self._mode == "usb":
             self._setup_usb()
-        elif self._mode == "gpio":
-            self._setup_gpio()
 
-        log.info("ButtonHandler: Modus '%s' aktiv (Tastatur zusätzlich)",
-                 self._mode)
+        log.info(
+            "ButtonHandler: Modus '%s' aktiv (Tastatur zusätzlich)",
+            self._mode,
+        )
 
-    # ------------------------------------------------------------------
-    # Auto-Erkennung
     # ------------------------------------------------------------------
     @staticmethod
     def _has_usb_gamepad() -> bool:
@@ -91,14 +75,8 @@ class ButtonHandler:
     def _resolve_mode(self, requested: InputMode) -> InputMode:
         if requested != "auto":
             return requested
-        if self._has_usb_gamepad():
-            return "usb"
-        if HAS_GPIO:
-            return "gpio"
-        return "keyboard"
+        return "usb" if self._has_usb_gamepad() else "keyboard"
 
-    # ------------------------------------------------------------------
-    # USB-Gamepad
     # ------------------------------------------------------------------
     def _setup_usb(self) -> None:
         if not pygame.get_init():
@@ -110,40 +88,12 @@ class ButtonHandler:
                         "falle auf Tastatur zurück")
             self._mode = "keyboard"
             return
-        if JOY_INDEX >= count:
-            log.warning("JOY_INDEX %d nicht vorhanden (nur %d Geräte), nehme 0",
-                        JOY_INDEX, count)
-            idx = 0
-        else:
-            idx = JOY_INDEX
-
+        idx = JOY_INDEX if JOY_INDEX < count else 0
         self._joy = pygame.joystick.Joystick(idx)
         self._joy.init()
         log.info("USB-Gamepad: %s (%d Buttons)",
                  self._joy.get_name(), self._joy.get_numbuttons())
-
-        # Button-Nummer → Aktion
         self._joy_map = {btn: action for action, btn in BUTTON_JOY.items()}
-
-    # ------------------------------------------------------------------
-    # GPIO
-    # ------------------------------------------------------------------
-    def _setup_gpio(self) -> None:
-        if not HAS_GPIO:
-            log.warning("GPIO-Modus gewählt, aber RPi.GPIO nicht verfügbar - "
-                        "falle auf Tastatur zurück")
-            self._mode = "keyboard"
-            return
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        for action, pin in BUTTON_PINS.items():
-            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.add_event_detect(
-                pin,
-                GPIO.FALLING,
-                callback=lambda _pin, a=action: self._on_press(a),
-                bouncetime=self.DEBOUNCE_MS,
-            )
 
     # ------------------------------------------------------------------
     def _to_pygame_key(self, ch: str) -> int:
@@ -159,11 +109,9 @@ class ButtonHandler:
 
     # ------------------------------------------------------------------
     def handle_pygame_event(self, event: pygame.event.Event) -> None:
-        # Tastatur immer
         if event.type == pygame.KEYDOWN and event.key in self._key_map:
             self._on_press(self._key_map[event.key])
             return
-        # USB-Gamepad
         if self._mode == "usb" and event.type == pygame.JOYBUTTONDOWN:
             action = self._joy_map.get(event.button)
             if action:
@@ -179,15 +127,12 @@ class ButtonHandler:
 
     def close(self) -> None:
         self._stop.set()
-        if self._mode == "gpio" and HAS_GPIO:
-            GPIO.cleanup(list(BUTTON_PINS.values()))
         if self._joy is not None:
             try:
                 self._joy.quit()
             except Exception:  # pragma: no cover
                 pass
 
-    # ------------------------------------------------------------------
     @property
     def mode(self) -> InputMode:
         return self._mode

@@ -1,8 +1,8 @@
 """Player-Store-Abstraktion.
 
 Der Rest der Anwendung hängt nur an dieser Schnittstelle - so kann derselbe
-Code entweder gegen die HTTP-API laufen oder gegen einen lokalen In-Memory-
-Store (Offline-Modus, z. B. für Tests ohne Server und ohne RFID-Hardware).
+Code entweder gegen den PPMaster-Bucket laufen oder gegen einen lokalen
+In-Memory-Store (Offline-Modus, für Tests ohne RFID und ohne Datenbank).
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Dict, Iterable, Optional, Protocol
 
-from .config import MOCK_RFID_KEYS
 from .game import Player
 
 
@@ -37,15 +36,15 @@ class PlayerStore(Protocol):
 class LocalPlayerStore:
     """In-Memory-Player-Datenbank für den Offline-Modus.
 
-    Beim Instanziieren werden drei Testspieler angelegt, deren UIDs zu den
-    Mock-RFID-Chips (Tasten 1/2/3) passen. So lässt sich die komplette
-    Anwendung auch ohne API-Server und ohne RFID-Hardware testen.
+    Beim Instanziieren werden drei Testspieler angelegt. Als UID dient
+    einfach der Name - im Offline-Modus reicht das, da keine echten RFID-
+    Chips angesprochen werden.
     """
 
     DEFAULT_PLAYERS = (
-        (MOCK_RFID_KEYS["1"], "Alice",   500),
-        (MOCK_RFID_KEYS["2"], "Bob",     250),
-        (MOCK_RFID_KEYS["3"], "Charlie", 1000),
+        ("alice",   "Alice",   500),
+        ("bob",     "Bob",     250),
+        ("charlie", "Charlie", 1000),
     )
 
     def __init__(
