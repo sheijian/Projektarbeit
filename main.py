@@ -70,6 +70,17 @@ def parse_args() -> argparse.Namespace:
         "--auto-register-balance", type=int, default=500,
         help="Startguthaben für auto-registrierte Gäste (Default 500).",
     )
+    p.add_argument(
+        "--starting-balance", type=int, default=0,
+        help="PPMaster: Startguthaben wenn der Spieler noch keine "
+             "endscore-Punkte in der letzten Stunde hat (Default 0).",
+    )
+    p.add_argument(
+        "--lookup-by", choices=("name", "uid"), default="name",
+        help="PPMaster: Mit welchem Wert wird in der DB nach dem Spieler "
+             "gesucht? 'name' = Anzeigename (Default, passt zum Beispiel "
+             "'rfidTag=Alice'), 'uid' = user_id vom RFID-Chip.",
+    )
     p.add_argument("--min-bet", type=int, default=DEFAULT_MIN_BET)
     p.add_argument("--default-bet", type=int, default=DEFAULT_BET)
     p.add_argument(
@@ -120,7 +131,7 @@ class App:
 
         from blackjack.ppmaster_store import PPMasterStore
         log.info("Store: PPMasterStore")
-        return PPMasterStore()
+        return PPMasterStore(starting_balance=args.starting_balance)
 
     def _auto_store_kind(self) -> str:
         """Nimmt PPMaster wenn .env konfiguriert ist, sonst local."""
@@ -181,12 +192,18 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
 
-        # Wenn der HTTP-Reader einen Anzeigenamen mitliefert, ist der die
-        # eigentliche Kennung im PPMaster-Bucket (Tag rfidTag=<name>).
         hint = None
         if isinstance(self.rfid, HTTPRFIDReader):
             hint = self.rfid.get_name_hint(uid)
-        lookup_key = hint if hint else uid
+
+        # Mit welchem Wert fragen wir die DB ab?
+        #   --lookup-by name (Default): den Anzeigenamen, falls bekannt;
+        #     Fallback uid, falls der Reader keinen Namen mitliefert.
+        #   --lookup-by uid: immer die UUID vom RFID-Chip.
+        if self.args.lookup_by == "uid":
+            lookup_key = uid
+        else:
+            lookup_key = hint if hint else uid
 
         try:
             player = self.store.get_player(lookup_key)

@@ -28,7 +28,7 @@ import requests
 
 from .db_config import INFLUX, InfluxConfig, load_influx_config
 from .game import Player
-from .store import PlayerNotFound, StoreError
+from .store import StoreError
 
 log = logging.getLogger(__name__)
 
@@ -43,28 +43,59 @@ class PPMasterStore:
     FIELD_KEY = "score"
     WINRATE_FIELD = "winrate"
 
-    def __init__(self, config: Optional[InfluxConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[InfluxConfig] = None,
+        starting_balance: int = 0,
+    ) -> None:
         self.config = config or load_influx_config()
         if not self.config.is_configured:
             raise StoreError(
                 "InfluxDB nicht konfiguriert - INFLUX_URL/ORG/BUCKET/"
                 "TOKEN_READ/TOKEN_WRITE in .env eintragen (siehe .env.example)."
             )
+        self.starting_balance = starting_balance
         self._session = requests.Session()
         # Aktuelles Startguthaben pro Tag, damit wir beim Session-Ende
         # das Netto-Delta wissen (aktuelles Guthaben minus Startguthaben).
         self._start_balances: dict[str, int] = {}
         log.info(
-            "PPMasterStore verbunden mit %s (org=%s, bucket=%s, range=%s)",
+            "PPMasterStore verbunden mit %s (org=%s, bucket=%s, range=%s, "
+            "starting_balance=%d)",
             self.config.url, self.config.org, self.config.bucket,
-            self.config.query_range,
+            self.config.query_range, self.starting_balance,
         )
 
     # ------------------------------------------------------------------
     # Lesen (Flux)
     # ------------------------------------------------------------------
     def get_player(self, rfid_tag: str) -> Player:
-        """Summiert alle ``score``-Punkte für diesen Tag als Startguthaben."""
+        """Summiert alle ``score``-Punkte für diesen Tag als Startguthaben.
+
+        Liefert immer einen ``Player`` zurück - wenn der Spieler in der
+        letzten Stunde noch keinen Datenpunkt hat, bekommt er das
+        konfigurierte ``starting_balance`` als Startkapital (Default 0).
+        """
+        total = self._sum_score(rfid_tag)
+        if total is None:
+            log.info(
+                "PPMaster: keine endscore-Punkte für rfidTag=%r in %s - "
+                "Startguthaben %d",
+                rfid_tag, self.config.query_range, self.starting_balance,
+            )
+            total = self.starting_balance
+        else:
+            log.info(
+                "PPMaster: rfidTag=%r hat %d Punkte in %s",
+                rfid_tag, total, self.config.query_range,
+            )
+
+        self._start_balances[rfid_tag] = total
+        return Player(rfid=rfid_tag, name=rfid_tag, balance=total)
+
+    def _sum_score(self, rfid_tag: str) -> Optional[int]:
+        """Setzt die Query ab und liefert die Summe (oder ``None``
+        wenn der Bucket für diesen Tag nichts hergibt)."""
         safe_tag = _escape_flux_string(rfid_tag)
         flux = (
             f'from(bucket: "{self.config.bucket}")\n'
@@ -74,6 +105,7 @@ class PPMasterStore:
             f'  |> filter(fn: (r) => r._field == "{self.FIELD_KEY}")\n'
             f'  |> sum()\n'
         )
+        log.debug("PPMaster-Query:\n%s", flux)
         try:
             r = self._session.post(
                 f"{self.config.url}/api/v2/query",
@@ -91,12 +123,8 @@ class PPMasterStore:
         if not r.ok:
             raise StoreError(f"InfluxDB HTTP {r.status_code}: {r.text[:120]}")
 
-        total = _parse_flux_sum_csv(r.text)
-        if total is None:
-            raise PlayerNotFound(rfid_tag)
-
-        self._start_balances[rfid_tag] = total
-        return Player(rfid=rfid_tag, name=rfid_tag, balance=total)
+        log.debug("PPMaster-Antwort (%d bytes): %s", len(r.text), r.text[:300])
+        return _parse_flux_sum_csv(r.text)
 
     # ------------------------------------------------------------------
     # Kein Live-Write pro Runde: die Buchhaltung passiert lokal im Game.

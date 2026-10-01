@@ -8,13 +8,25 @@ Session-Statistik im Game).
 import random
 
 from blackjack.cards import Card
+from blackjack.db_config import InfluxConfig
 from blackjack.game import Game, Player
 from blackjack.ppmaster_store import (
+    PPMasterStore,
     _escape_flux_string,
     _escape_line_protocol_tag,
     _parse_flux_sum_csv,
 )
 from tests.test_game import StackedDeck
+
+
+_TEST_CFG = InfluxConfig(
+    url="http://example.local",
+    org="o",
+    bucket="b",
+    bucket_id="bi",
+    token_read="tr",
+    token_write="tw",
+)
 
 
 def C(rank, suit="spades"):
@@ -131,3 +143,44 @@ def test_session_reset_on_logout():
     game.logout()
     assert game.session_plays == 0
     assert game.session_wins == 0
+
+
+# ---------------------------------------------------------------------------
+# Startguthaben wenn der Spieler noch keine Punkte im Bucket hat
+# ---------------------------------------------------------------------------
+class _FakeStore(PPMasterStore):
+    """Umgeht den HTTP-Call, damit wir die get_player()-Logik testen können."""
+
+    def __init__(self, sum_result, starting_balance=0):
+        # Minimaler Setup ohne __init__ des Elterns.
+        self.config = _TEST_CFG
+        self.starting_balance = starting_balance
+        self._session = None
+        self._start_balances = {}
+        self._sum_result = sum_result
+
+    def _sum_score(self, rfid_tag):
+        return self._sum_result
+
+
+def test_get_player_returns_starting_balance_when_bucket_empty():
+    store = _FakeStore(sum_result=None, starting_balance=250)
+    player = store.get_player("Jonathan")
+    assert player.rfid == "Jonathan"
+    assert player.balance == 250
+    # Für finalize_session wird der Start als Baseline gemerkt.
+    assert store._start_balances["Jonathan"] == 250
+
+
+def test_get_player_defaults_to_zero_without_starting_balance():
+    store = _FakeStore(sum_result=None)
+    player = store.get_player("NeuerSpieler")
+    assert player.balance == 0
+
+
+def test_get_player_uses_db_sum_when_present():
+    store = _FakeStore(sum_result=180, starting_balance=1000)
+    player = store.get_player("Alice")
+    # DB hat Punkte - das Startguthaben wird NICHT addiert.
+    assert player.balance == 180
+    assert store._start_balances["Alice"] == 180
