@@ -72,8 +72,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--starting-balance", type=int, default=0,
-        help="PPMaster: Startguthaben wenn der Spieler noch keine "
-             "endscore-Punkte in der letzten Stunde hat (Default 0).",
+        help="Startguthaben für Spieler, die der DB noch unbekannt sind. "
+             "Bei PPMaster: Fallback wenn in der letzten Stunde keine "
+             "endscore-Punkte gefunden werden. Bei --store local: aktiviert "
+             "implizit auto-register, so dass unbekannte RFIDs direkt mit "
+             "diesem Betrag spielen können. Default 0.",
     )
     p.add_argument(
         "--lookup-by", choices=("name", "uid"), default="name",
@@ -120,13 +123,21 @@ class App:
             store_kind = self._auto_store_kind()
 
         if store_kind == "local":
+            # --starting-balance greift auch hier: aktiviert implizit
+            # auto-register, damit unbekannte RFIDs sofort spielen können.
+            auto_register = args.auto_register or args.starting_balance > 0
+            auto_balance = (
+                args.starting_balance if args.starting_balance > 0
+                else args.auto_register_balance
+            )
             log.info(
-                "Store: LocalPlayerStore (Offline-Modus, auto_register=%s)",
-                args.auto_register,
+                "Store: LocalPlayerStore (Offline-Modus, auto_register=%s, "
+                "auto_balance=%d)",
+                auto_register, auto_balance,
             )
             return LocalPlayerStore(
-                auto_register=args.auto_register,
-                auto_balance=args.auto_register_balance,
+                auto_register=auto_register,
+                auto_balance=auto_balance,
             )
 
         from blackjack.ppmaster_store import PPMasterStore
@@ -141,6 +152,15 @@ class App:
                 return "ppmaster"
         except Exception:
             pass
+        log.warning(
+            ".env fehlt oder ist unvollständig - PPMaster-Bucket nicht "
+            "erreichbar. Falle auf LocalPlayerStore zurück."
+        )
+        log.warning(
+            "Zum Anbinden an PPMaster: `cp .env.example .env` und dann in "
+            ".env die Zugangsdaten (INFLUX_URL/ORG/BUCKET/TOKEN_READ/"
+            "TOKEN_WRITE) eintragen."
+        )
         return "local"
 
     # ------------------------------------------------------------------
