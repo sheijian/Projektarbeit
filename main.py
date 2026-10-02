@@ -1,18 +1,22 @@
 """Blackjack-Automat – Einstiegspunkt.
 
-Verkabelt Spiellogik, GUI, Arcade-Taster, Guthaben-Store und den
-HTTP-RFID-Reader des ESP32 zu einer kompletten Anwendung.
+Verkabelt Spiellogik, GUI, Arcade-Taster, Guthaben-Store, HTTP-RFID-
+Reader (ESP32) und die InfluxDB (für den Username-Lookup) zu einer
+kompletten Anwendung.
 
 Beispiele:
 
-    # Standard: ESP32-RFID + PPMaster-Bucket (wenn .env konfiguriert)
+    # Standard: ESP32-RFID + Username aus InfluxDB
     python main.py
 
-    # Spielen ohne RFID/DB (Alice wird automatisch angemeldet)
+    # Spielen ohne RFID (Alice wird automatisch angemeldet)
     python main.py --offline
 
     # Alternative RFID-URL
     python main.py --rfid-url http://192.168.1.42/status
+
+    # Live-Reader-Test mit beliebigem Startguthaben
+    python main.py --starting-balance 500
 """
 
 from __future__ import annotations
@@ -24,12 +28,13 @@ from typing import Optional
 
 import pygame
 
+from blackjack import influx_db
 from blackjack.buttons import ButtonHandler
 from blackjack.config import DEFAULT_BET, DEFAULT_MIN_BET, DEFAULT_RFID_URL
 from blackjack.game import Game, Player
 from blackjack.gui import BlackjackGUI
 from blackjack.rfid import HTTPRFIDReader
-from blackjack.store import LocalPlayerStore, PlayerNotFound, PlayerStore, StoreError
+from blackjack.store import LocalPlayerStore
 
 
 log = logging.getLogger("blackjack")
@@ -39,17 +44,12 @@ log = logging.getLogger("blackjack")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Blackjack-Automat")
     p.add_argument(
-        "--store", choices=("auto", "ppmaster", "local"), default="auto",
-        help="Guthaben-Backend. 'auto' nimmt ppmaster (wenn .env konfiguriert), "
-             "sonst local. 'local' = In-Memory (Offline-Modus).",
-    )
-    p.add_argument(
         "--rfid-url", metavar="URL", default=DEFAULT_RFID_URL,
         help=f"HTTP-URL des RFID-Readers (Default: {DEFAULT_RFID_URL}).",
     )
     p.add_argument(
         "--offline", action="store_true",
-        help="Kurzform für --store local --no-rfid (Alice wird auto-angemeldet).",
+        help="Kein RFID - Alice wird automatisch angemeldet.",
     )
     p.add_argument(
         "--auto-login", metavar="NAME", default="Alice",
@@ -61,34 +61,17 @@ def parse_args() -> argparse.Namespace:
         help="Offline-Modus ohne Auto-Login - stattdessen auf RFID warten.",
     )
     p.add_argument(
-        "--auto-register", action="store_true",
-        help="Nur mit --store local: unbekannte RFID-UIDs werden als "
-             "frischer Gast mit Startguthaben angelegt (praktisch für "
-             "Reader-Tests ohne DB).",
-    )
-    p.add_argument(
-        "--auto-register-balance", type=int, default=500,
-        help="Startguthaben für auto-registrierte Gäste (Default 500).",
-    )
-    p.add_argument(
-        "--starting-balance", type=int, default=0,
-        help="Startguthaben für Spieler, die der DB noch unbekannt sind. "
-             "Bei PPMaster: Fallback wenn in der letzten Stunde keine "
-             "endscore-Punkte gefunden werden. Bei --store local: aktiviert "
-             "implizit auto-register, so dass unbekannte RFIDs direkt mit "
-             "diesem Betrag spielen können. Default 0.",
-    )
-    p.add_argument(
-        "--lookup-by", choices=("name", "uid"), default="name",
-        help="PPMaster: Mit welchem Wert wird in der DB nach dem Spieler "
-             "gesucht? 'name' = Anzeigename (Default, passt zum Beispiel "
-             "'rfidTag=Alice'), 'uid' = user_id vom RFID-Chip.",
+        "--starting-balance", type=int, default=500,
+        help="Startguthaben für unbekannte RFID-UIDs (Default 500). "
+             "Solange die Punkte-Abfrage noch nicht an InfluxDB angebunden "
+             "ist, bekommt jeder Spieler diesen Betrag.",
     )
     p.add_argument("--min-bet", type=int, default=DEFAULT_MIN_BET)
     p.add_argument("--default-bet", type=int, default=DEFAULT_BET)
     p.add_argument(
         "--input", choices=("auto", "usb", "keyboard"), default="auto",
-        help="Eingabequelle für die Arcade-Taster (Default: auto - USB, sonst Tastatur).",
+        help="Eingabequelle für die Arcade-Taster "
+             "(Default: auto - USB, sonst Tastatur).",
     )
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -98,7 +81,18 @@ def parse_args() -> argparse.Namespace:
 class App:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.store: PlayerStore = self._build_store(args)
+
+        # Guthaben wird aktuell lokal verwaltet. Unbekannte UIDs werden
+        # mit --starting-balance direkt angelegt - die DB-Punkte-Abfrage
+        # steht noch aus (siehe blackjack/influx_db.query_points).
+        self.store = LocalPlayerStore(
+            auto_register=True,
+            auto_balance=args.starting_balance,
+        )
+        log.info(
+            "Store: LocalPlayerStore (auto_register=True, auto_balance=%d)",
+            args.starting_balance,
+        )
 
         self.game = Game(
             min_bet=args.min_bet,
@@ -107,7 +101,6 @@ class App:
         self.gui = BlackjackGUI(self.game)
         self.buttons = ButtonHandler(mode=args.input)
 
-        # Im Offline-Modus mit Auto-Login brauchen wir keinen RFID-Reader.
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
             self.rfid: Optional[HTTPRFIDReader] = None
@@ -116,58 +109,8 @@ class App:
             self.rfid = HTTPRFIDReader(args.rfid_url)
 
     # ------------------------------------------------------------------
-    def _build_store(self, args: argparse.Namespace) -> PlayerStore:
-        store_kind = "local" if args.offline else args.store
-
-        if store_kind == "auto":
-            store_kind = self._auto_store_kind()
-
-        if store_kind == "local":
-            # --starting-balance greift auch hier: aktiviert implizit
-            # auto-register, damit unbekannte RFIDs sofort spielen können.
-            auto_register = args.auto_register or args.starting_balance > 0
-            auto_balance = (
-                args.starting_balance if args.starting_balance > 0
-                else args.auto_register_balance
-            )
-            log.info(
-                "Store: LocalPlayerStore (Offline-Modus, auto_register=%s, "
-                "auto_balance=%d)",
-                auto_register, auto_balance,
-            )
-            return LocalPlayerStore(
-                auto_register=auto_register,
-                auto_balance=auto_balance,
-            )
-
-        from blackjack.ppmaster_store import PPMasterStore
-        log.info("Store: PPMasterStore")
-        return PPMasterStore(starting_balance=args.starting_balance)
-
-    def _auto_store_kind(self) -> str:
-        """Nimmt PPMaster wenn .env konfiguriert ist, sonst local."""
-        try:
-            from blackjack.db_config import INFLUX
-            if INFLUX.is_configured:
-                return "ppmaster"
-        except Exception:
-            pass
-        log.warning(
-            ".env fehlt oder ist unvollständig - PPMaster-Bucket nicht "
-            "erreichbar. Falle auf LocalPlayerStore zurück."
-        )
-        log.warning(
-            "Zum Anbinden an PPMaster: `cp .env.example .env` und dann in "
-            ".env die Zugangsdaten (INFLUX_URL/ORG/BUCKET/TOKEN_READ/"
-            "TOKEN_WRITE) eintragen."
-        )
-        return "local"
-
-    # ------------------------------------------------------------------
     def run(self) -> int:
-        # Auto-Login erst nach dem ersten Frame, damit die GUI schon steht.
         first_frame = True
-
         running = True
         while running:
             for event in pygame.event.get():
@@ -212,39 +155,20 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
 
-        hint = None
-        if isinstance(self.rfid, HTTPRFIDReader):
-            hint = self.rfid.get_name_hint(uid)
+        # Guthaben: aktuell aus LocalPlayerStore (Punkte-Abfrage ist TODO).
+        player = self.store.get_player(uid)
 
-        # Mit welchem Wert fragen wir die DB ab?
-        #   --lookup-by name (Default): den Anzeigenamen, falls bekannt;
-        #     Fallback uid, falls der Reader keinen Namen mitliefert.
-        #   --lookup-by uid: immer die UUID vom RFID-Chip.
-        if self.args.lookup_by == "uid":
-            lookup_key = uid
-        else:
-            lookup_key = hint if hint else uid
-
-        try:
-            player = self.store.get_player(lookup_key)
-        except PlayerNotFound:
-            self.game.logout()
-            self.game.message = f"Unbekannter Chip: {lookup_key}"
-            return
-        except StoreError as e:
-            log.warning("Store-Fehler: %s", e)
-            self.game.logout()
-            self.game.message = "Datenbank nicht erreichbar"
-            return
-
-        # Anzeigename im HUD ist der lesbare Name, falls vorhanden.
-        if hint:
-            player.name = hint
+        # Username: zuerst aus der InfluxDB; Fallback = Name, den der
+        # ESP32-Reader selbst mitgeliefert hat; Fallback = UUID.
+        name = influx_db.query_username(uid)
+        if not name and isinstance(self.rfid, HTTPRFIDReader):
+            name = self.rfid.get_name_hint(uid)
+        if name:
+            player.name = name
 
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _auto_login(self, name: str) -> None:
-        assert isinstance(self.store, LocalPlayerStore)
         player = self.store.find_by_name(name)
         if player is None:
             available = ", ".join(p.name for p in self.store.all_players())
@@ -257,22 +181,22 @@ class App:
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _finalize_current_session(self) -> None:
-        """Schreibt Endscore + Winrate in den Bucket (nur bei PPMasterStore)."""
+        """Session-Ende: Delta + Winrate in den Bucket schreiben (TODO)."""
         if self.game.player is None:
-            return
-        if not hasattr(self.store, "finalize_session"):
             return
         if self.game.session_plays <= 0:
             return
+        start = self.store.get_player(self.game.player.rfid).balance
+        delta = self.game.player.balance - start
         try:
-            self.store.finalize_session(   # type: ignore[attr-defined]
+            influx_db.write_session_end(
                 self.game.player.rfid,
-                self.game.player.balance,
+                delta,
                 self.game.session_wins,
                 self.game.session_plays,
             )
         except Exception as e:
-            log.warning("finalize_session fehlgeschlagen: %s", e)
+            log.warning("write_session_end fehlgeschlagen: %s", e)
 
     # ------------------------------------------------------------------
     # Taster
@@ -297,7 +221,6 @@ class App:
 
     # ------------------------------------------------------------------
     def _on_balance_change(self, player: Player, delta: int) -> None:
-        """Callback aus dem Game – Delta an den Store zurückspiegeln."""
         new_balance = self.store.apply_delta(player.rfid, delta)
         if new_balance is not None:
             player.balance = new_balance
@@ -313,12 +236,6 @@ class App:
         if self.rfid is not None:
             try:
                 self.rfid.close()
-            except Exception:  # pragma: no cover
-                pass
-        close_fn = getattr(self.store, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
             except Exception:  # pragma: no cover
                 pass
         self.gui.close()

@@ -9,7 +9,7 @@ __all__ = [
     "buttons",
     "rfid",
     "store",
-    "ppmaster_store",
+    "influx_db",
     "db_config",
     "config",
 ]

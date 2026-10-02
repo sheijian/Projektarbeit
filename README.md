@@ -68,8 +68,8 @@ python main.py --offline
 # Alternative RFID-URL
 python main.py --rfid-url http://192.168.1.42/status
 
-# Reader-Test ohne DB: jede unbekannte UID wird als Gast angelegt
-python main.py --store local --auto-register --no-auto-login
+# Reader-Test mit festem Startguthaben pro unbekanntem Chip
+python main.py --starting-balance 1000
 ```
 
 ## Ablauf
@@ -83,35 +83,29 @@ Der ESP32-Reader meldet unter seiner Statusseite:
 ```
 
 Nur wenn `status == "logged_in"` wird der Spieler eingeloggt. Die
-`username` landet im HUD als "Spieler: Jonathan", die DB-Abfrage nutzt
-den Namen als `rfidTag` im PPMaster-Bucket.
+`user_id` wird dann an `blackjack/influx_db.query_username(uid)` gegeben,
+das die DB nach dem **tatsächlichen Anzeigenamen** fragt (das Field
+`username` aus dem Measurement `PPMaster`). Dieser Name steht
+anschließend im HUD als "Spieler: Jonathan". Als Fallback wird der
+`username`-Wert aus der ESP32-Antwort verwendet.
 
 ### Datenbank (PPMaster-Bucket in InfluxDB)
 
-Beim Login:
+Die aktuelle Username-Query:
 
 ```flux
 from(bucket: "PPMaster")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "endscore")
-  |> filter(fn: (r) => r.rfidTag == "<name>")
-  |> filter(fn: (r) => r._field == "score")
-  |> sum()
+  |> range(start: 0)
+  |> filter(fn: (r) => r._measurement == "PPMaster")
+  |> filter(fn: (r) => r._field == "username")
+  |> filter(fn: (r) => r.user_id == "<uuid>")
+  |> last()
 ```
 
-Die Summe ist das Startguthaben.
-
-Beim Session-Ende (Chip wird abgehoben oder Programm beendet) werden
-zwei neue Datenpunkte geschrieben:
-
-```
-endscore,rfidTag=<name> score=<netto-delta>i <timestamp_ms>
-winrate,rfidTag=<name>  winrate=<prozent>i   <timestamp_ms>
-```
-
-Gespeichert wird der **Netto-Delta** dieses Durchlaufs, nicht der neue
-Kontostand - sonst würden die Beiträge der anderen Stationen bei der
-nächsten Summierung doppelt gezählt.
+Alle weiteren DB-Operationen (Punkte-Abfrage, Endscore + Winrate
+schreiben) sind in `blackjack/influx_db.py` als Platzhalter angelegt
+(`query_points`, `write_session_end`) - dort kommen die Queries hin,
+sobald das Datenmodell dafür feststeht.
 
 ## Steuerung
 
