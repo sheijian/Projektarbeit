@@ -94,6 +94,21 @@ class App:
             args.starting_balance,
         )
 
+        # Zeige klar an, ob die InfluxDB-Verbindung bereit ist.
+        from blackjack.influx_db import _effective_config
+        cfg = _effective_config()
+        if cfg.is_configured:
+            log.info(
+                "InfluxDB: %s (org=%s, bucket=%s) - bereit",
+                cfg.url, cfg.org, cfg.bucket,
+            )
+        else:
+            log.warning(
+                "InfluxDB nicht konfiguriert - Username-Lookup inaktiv. "
+                "Trage den Lese-Token in blackjack/influx_db.py (ganz oben, "
+                "INFLUX_TOKEN_READ) oder in .env ein."
+            )
+
         self.game = Game(
             min_bet=args.min_bet,
             on_balance_change=self._on_balance_change,

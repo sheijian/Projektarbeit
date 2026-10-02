@@ -27,6 +27,50 @@ from .db_config import INFLUX, InfluxConfig, load_influx_config
 log = logging.getLogger(__name__)
 
 
+# ===========================================================================
+# InfluxDB-Zugangsdaten
+# ===========================================================================
+# Hier kannst du Server/Bucket/Tokens direkt eintragen. Die Werte unten
+# gewinnen gegenüber einer evtl. vorhandenen .env-Datei (sofern sie
+# nicht leer sind).
+#
+# WICHTIG: Wenn du die Tokens hier einträgst, pass auf, dass du die
+# Datei NICHT mit echten Tokens committest - sonst stehen sie im
+# öffentlichen Git-Repo. Entweder vor dem Commit wieder leer machen
+# oder stattdessen die .env-Lösung benutzen (siehe .env.example).
+# ===========================================================================
+INFLUX_URL         = "http://10.0.244.254:8086"
+INFLUX_ORG         = "FIT244"
+INFLUX_BUCKET      = "PPMaster"
+INFLUX_BUCKET_ID   = "0a38c021dbad8b0c"
+
+# <<< HIER DEN LESE-TOKEN EINFÜGEN >>>
+INFLUX_TOKEN_READ  = ""
+
+# <<< HIER DEN SCHREIB-TOKEN EINFÜGEN >>>
+INFLUX_TOKEN_WRITE = ""
+# ===========================================================================
+
+
+def _effective_config() -> InfluxConfig:
+    """Nimmt die Konstanten oben, wenn sie gefüllt sind - sonst .env.
+
+    So kann man wahlweise den Token direkt in dieser Datei eintragen oder
+    (sauberer) in .env - beides funktioniert, Code gewinnt.
+    """
+    env = INFLUX
+    read_token  = INFLUX_TOKEN_READ  or env.token_read
+    write_token = INFLUX_TOKEN_WRITE or env.token_write
+    return InfluxConfig(
+        url=INFLUX_URL or env.url,
+        org=INFLUX_ORG or env.org,
+        bucket=INFLUX_BUCKET or env.bucket,
+        bucket_id=INFLUX_BUCKET_ID or env.bucket_id,
+        token_read=read_token,
+        token_write=write_token,
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTTP-Session (lazy)
 # ---------------------------------------------------------------------------
@@ -63,9 +107,12 @@ def query_username(
     fatal - der Aufrufer kann auf den Namen vom ESP32-Reader zurück-
     fallen.
     """
-    cfg = cfg or INFLUX
+    cfg = cfg or _effective_config()
     if not cfg.is_configured:
-        log.debug("query_username: InfluxDB nicht konfiguriert")
+        log.debug(
+            "query_username: InfluxDB nicht konfiguriert "
+            "(INFLUX_TOKEN_READ in blackjack/influx_db.py leer?)"
+        )
         return None
 
     safe_id = _escape_flux_string(user_id)
