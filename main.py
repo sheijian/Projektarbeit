@@ -207,8 +207,17 @@ class App:
         Schreibt den aktuellen Kontostand des Spielers nach SpieloAutomat,
         damit der neue Wert sofort für jeden Chip-Scan verfügbar ist.
         """
+        log.info(
+            "Runde beendet - schreibe Score %d für user_id=%s nach SpieloAutomat",
+            player.balance, player.rfid,
+        )
         try:
-            influx_db.write_endscore(player.rfid, player.balance)
+            ok = influx_db.write_endscore(player.rfid, player.balance)
+            if not ok:
+                log.warning(
+                    "write_endscore hat KEINEN Schreibvorgang durchgeführt - "
+                    "Token ok? Schreibrechte auf SpieloAutomat? Siehe DEBUG-Log."
+                )
         except Exception as e:
             log.warning("write_endscore nach Runde fehlgeschlagen: %s", e)
 

@@ -53,6 +53,20 @@ INFLUX_TOKEN_WRITE = ""
 # ===========================================================================
 
 
+# ===========================================================================
+# Schema des SpieloAutomat-Buckets
+# ===========================================================================
+# Falls die DB mit anderen Namen eingerichtet ist, hier anpassen - diese
+# Konstanten werden von query_points, write_endscore UND dem
+# scripts/score_aggregator.py benutzt. So bleibt alles konsistent.
+# ===========================================================================
+POINTS_BUCKET      = "SpieloAutomat"
+POINTS_MEASUREMENT = "endscore"
+POINTS_FIELD       = "score"
+POINTS_TAG         = "user_id"      # <-- Tag-Name im SpieloAutomat
+# ===========================================================================
+
+
 def _effective_config() -> InfluxConfig:
     """Nimmt die Konstanten oben, wenn sie gefüllt sind - sonst .env.
 
@@ -94,12 +108,6 @@ def _get_session() -> requests.Session:
 USERNAME_MEASUREMENT = "PPMaster"
 USERNAME_FIELD = "username"
 USERNAME_TAG = "user_id"
-
-
-POINTS_BUCKET = "SpieloAutomat"
-POINTS_MEASUREMENT = "endscore"
-POINTS_FIELD = "score"
-POINTS_TAG = "user_id"
 
 
 def query_points(
@@ -206,7 +214,10 @@ def write_endscore(
     """
     cfg = cfg or _effective_config()
     if not cfg.is_configured:
-        log.warning("write_endscore: InfluxDB nicht konfiguriert")
+        log.warning(
+            "write_endscore: InfluxDB nicht konfiguriert - "
+            "INFLUX_TOKEN_WRITE in blackjack/influx_db.py (oder .env) fehlt?"
+        )
         return False
 
     safe_uid = _escape_line_protocol_tag(user_id)
@@ -214,6 +225,10 @@ def write_endscore(
     line = (
         f"{POINTS_MEASUREMENT},{POINTS_TAG}={safe_uid} "
         f"{POINTS_FIELD}={int(score)}i {ts_ms}\n"
+    )
+    log.debug(
+        "write_endscore -> %s/api/v2/write?bucket=%s  LINE: %s",
+        cfg.url, POINTS_BUCKET, line.strip(),
     )
 
     sess = session or _get_session()
@@ -233,16 +248,20 @@ def write_endscore(
             timeout=5,
         )
     except requests.RequestException as e:
-        log.warning("write_endscore: %s", e)
+        log.warning("write_endscore: Netzwerkfehler: %s", e)
         return False
     if not r.ok:
         log.warning(
-            "write_endscore HTTP %s: %s",
-            r.status_code, r.text[:120],
+            "write_endscore HTTP %s - Antwort: %s | Line: %s",
+            r.status_code, r.text[:300], line.strip(),
         )
         return False
-    log.info("write_endscore: user_id=%s score=%d (SpieloAutomat)",
-             user_id, score)
+    log.info(
+        "write_endscore OK: user_id=%s score=%d (bucket=%s, measurement=%s, "
+        "tag=%s, field=%s)",
+        user_id, score, POINTS_BUCKET, POINTS_MEASUREMENT,
+        POINTS_TAG, POINTS_FIELD,
+    )
     return True
 
 
