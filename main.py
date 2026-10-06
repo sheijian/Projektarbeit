@@ -170,11 +170,15 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
 
-        # Guthaben: aktuell aus LocalPlayerStore (Punkte-Abfrage ist TODO).
+        # Startguthaben aus dem SpieloAutomat-Bucket (vom Aggregator
+        # befüllt). Fallback: --starting-balance.
+        points = influx_db.query_points(uid)
+        if points is not None:
+            self.store.set_balance(uid, points)
         player = self.store.get_player(uid)
 
         # Username: zuerst aus der InfluxDB; Fallback = Name, den der
-        # ESP32-Reader selbst mitgeliefert hat; Fallback = UUID.
+        # ESP32-Reader selbst mitgeliefert hat.
         name = influx_db.query_username(uid)
         if not name and isinstance(self.rfid, HTTPRFIDReader):
             name = self.rfid.get_name_hint(uid)

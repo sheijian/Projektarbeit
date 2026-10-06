@@ -89,23 +89,69 @@ das die DB nach dem **tatsächlichen Anzeigenamen** fragt (das Field
 anschließend im HUD als "Spieler: Jonathan". Als Fallback wird der
 `username`-Wert aus der ESP32-Antwort verwendet.
 
-### Datenbank (PPMaster-Bucket in InfluxDB)
+### Datenbank-Zugriffe (`blackjack/influx_db.py`)
 
-Die aktuelle Username-Query:
+Alle InfluxDB-Zugriffe stehen in einer einzigen Datei:
+
+| Funktion                          | Zweck                                                    |
+|-----------------------------------|----------------------------------------------------------|
+| `query_username(user_id)`         | Anzeigename aus Bucket **PPMaster** (last)               |
+| `query_points(user_id)`           | Guthaben aus Bucket **SpieloAutomat** (last, siehe unten)|
+| `write_session_end(...)`          | Session-Ergebnis zurückschreiben (noch TODO)           |
+
+Die Punkte-Abfrage sieht so aus:
 
 ```flux
-from(bucket: "PPMaster")
+from(bucket: "SpieloAutomat")
   |> range(start: 0)
-  |> filter(fn: (r) => r._measurement == "PPMaster")
-  |> filter(fn: (r) => r._field == "username")
+  |> filter(fn: (r) => r._measurement == "endscore")
+  |> filter(fn: (r) => r._field == "score")
   |> filter(fn: (r) => r.user_id == "<uuid>")
   |> last()
 ```
 
-Alle weiteren DB-Operationen (Punkte-Abfrage, Endscore + Winrate
-schreiben) sind in `blackjack/influx_db.py` als Platzhalter angelegt
-(`query_points`, `write_session_end`) - dort kommen die Queries hin,
-sobald das Datenmodell dafür feststeht.
+Den Bucket `SpieloAutomat` füllt der Aggregator (siehe unten).
+
+## Score-Aggregator (Hintergrund-Dienst)
+
+Die sechs anderen Spielstationen speichern ihre Endscores jeweils in
+einem eigenen Bucket mit unterschiedlichem Schema:
+
+| Bucket              | Measurement           | Field          | Tag       |
+|---------------------|-----------------------|----------------|-----------|
+| HeisserDraht        | Endscore              | Endscore       | userID    |
+| Ampelsequenz        | endscore              | score          | rfidTag   |
+| TimerStrike         | endscore              | score          | user_id   |
+| Wurfgenauigkeit     | spieler_ergebnisse    | gesamtpunkte   | user_id   |
+| Whackamole          | endscore              | score          | rfidTag   |
+| Gedaechtnistest     | endscore              | endscore       | user_id   |
+
+Das Skript `scripts/score_aggregator.py` läuft dauerhaft auf dem Pi,
+pollt alle 5 Sekunden diese Buckets, summiert pro `user_id` und
+schreibt den Gesamtscore in `SpieloAutomat`
+(measurement `endscore`, field `score`, tag `user_id`).
+
+### Manuell starten (zum Testen)
+
+```bash
+python -m scripts.score_aggregator --verbose     # Dauerlauf
+python -m scripts.score_aggregator --once        # ein Durchlauf
+```
+
+### Als Dienst dauerhaft laufen lassen
+
+```bash
+sudo cp scripts/blackjack-aggregator.service /etc/systemd/system/
+# in der Service-Datei User= und WorkingDirectory= an den eigenen
+# Pfad anpassen (admin + ~/Documents/Projektarbeit-... als Default)
+sudo systemctl daemon-reload
+sudo systemctl enable --now blackjack-aggregator.service
+journalctl -u blackjack-aggregator -f            # Logs mitlesen
+```
+
+Der Token muss Lese-Zugriff auf alle sechs Quell-Buckets und Schreib-
+Zugriff auf `SpieloAutomat` haben. Trage ihn – wie beim Blackjack-
+Programm selbst – ganz oben in `blackjack/influx_db.py` ein.
 
 ## Steuerung
 

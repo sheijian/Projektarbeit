@@ -95,6 +95,55 @@ USERNAME_FIELD = "username"
 USERNAME_TAG = "user_id"
 
 
+POINTS_BUCKET = "SpieloAutomat"
+POINTS_MEASUREMENT = "endscore"
+POINTS_FIELD = "score"
+POINTS_TAG = "user_id"
+
+
+def query_points(
+    user_id: str,
+    cfg: Optional[InfluxConfig] = None,
+    session: Optional[requests.Session] = None,
+) -> Optional[int]:
+    """Liest den aktuellen Gesamt-Score aus dem SpieloAutomat-Bucket.
+
+    Die Werte dort werden vom Aggregator (``scripts/score_aggregator.py``)
+    aus den sechs anderen Spielstationen-Buckets zusammengerechnet.
+    """
+    cfg = cfg or _effective_config()
+    if not cfg.is_configured:
+        return None
+
+    safe_id = _escape_flux_string(user_id)
+    flux = (
+        f'from(bucket: "{POINTS_BUCKET}")\n'
+        f'  |> range(start: 0)\n'
+        f'  |> filter(fn: (r) => r._measurement == "{POINTS_MEASUREMENT}")\n'
+        f'  |> filter(fn: (r) => r._field == "{POINTS_FIELD}")\n'
+        f'  |> filter(fn: (r) => r.{POINTS_TAG} == "{safe_id}")\n'
+        f'  |> last()\n'
+    )
+    log.debug("Influx query_points:\n%s", flux)
+    text = _run_query(flux, cfg, session)
+    if text is None:
+        return None
+    raw = _parse_flux_first_value(text)
+    if raw is None:
+        log.info("Influx query_points(%s) -> noch kein Score", user_id)
+        return None
+    try:
+        points = int(float(raw))
+    except ValueError:
+        log.warning("Influx query_points: ungültiger Wert %r", raw)
+        return None
+    log.info("Influx query_points(%s) -> %d", user_id, points)
+    return points
+
+
+# ---------------------------------------------------------------------------
+# Username
+# ---------------------------------------------------------------------------
 def query_username(
     user_id: str,
     cfg: Optional[InfluxConfig] = None,
@@ -138,28 +187,22 @@ def query_username(
 
 
 # ---------------------------------------------------------------------------
-# Platzhalter für die kommenden Operationen (Punkte, Session-Ende)
+# Session-Ende
 # ---------------------------------------------------------------------------
-def query_points(user_id: str) -> Optional[int]:
-    """TODO: Startguthaben des Spielers aus dem Bucket laden.
-
-    Sobald das Datenmodell für die Punkte feststeht, hier die Query
-    einbauen (analog zu ``query_username``). Bis dahin ``None``.
-    """
-    log.debug("query_points: noch nicht implementiert")
-    return None
-
-
 def write_session_end(
     user_id: str,
     delta: int,
     wins: int,
     plays: int,
+    cfg: Optional[InfluxConfig] = None,
+    session: Optional[requests.Session] = None,
 ) -> None:
     """TODO: Endscore + Winrate nach Session-Ende in den Bucket schreiben.
 
-    Noch nicht implementiert - loggt nur die Werte, damit man im Test
-    sieht, was später geschrieben würde.
+    Platzhalter - sobald wir uns darauf einigen, in welchen Bucket die
+    Blackjack-Session-Ergebnisse zurückfließen sollen, kommt hier das
+    passende Line-Protocol-Write hin. Bis dahin wird nur geloggt, damit
+    man im Spiel sieht was geschrieben würde.
     """
     log.info(
         "write_session_end TODO: user_id=%s delta=%+d wins=%d plays=%d",
@@ -206,6 +249,48 @@ def _run_query(
 # ---------------------------------------------------------------------------
 # Flux-CSV-Parser und Escaping
 # ---------------------------------------------------------------------------
+def parse_flux_grouped_sum(text: str, tag_name: str) -> dict[str, int]:
+    """Parst eine Flux-CSV mit mehreren Tabellen (eine pro Tag-Wert).
+
+    Liefert ``{tag_value: aggregierte_summe}`` - mehrfaches Auftauchen
+    desselben Tag-Werts wird addiert, nicht überschrieben.
+    """
+    result: dict[str, int] = {}
+    reader = csv.reader(io.StringIO(text))
+    value_idx: Optional[int] = None
+    tag_idx: Optional[int] = None
+    for row in reader:
+        if not row:
+            value_idx = tag_idx = None
+            continue
+        first = (row[0] or "").strip()
+        if first.startswith("#"):
+            value_idx = tag_idx = None
+            continue
+        if value_idx is None or tag_idx is None:
+            # Header-Kandidat.
+            try:
+                value_idx = row.index("_value")
+            except ValueError:
+                value_idx = None
+            try:
+                tag_idx = row.index(tag_name)
+            except ValueError:
+                tag_idx = None
+            continue
+        if value_idx >= len(row) or tag_idx >= len(row):
+            continue
+        tag_val = row[tag_idx].strip()
+        raw = row[value_idx].strip()
+        if not tag_val or not raw:
+            continue
+        try:
+            result[tag_val] = result.get(tag_val, 0) + int(float(raw))
+        except ValueError:
+            continue
+    return result
+
+
 def _parse_flux_first_value(text: str) -> Optional[str]:
     """Extrahiert den ersten ``_value`` aus einer annotierten Flux-CSV.
 

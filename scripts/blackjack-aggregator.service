@@ -1,0 +1,31 @@
+# systemd-Service für den Score-Aggregator.
+#
+# Installieren (als root bzw. mit sudo):
+#   sudo cp scripts/blackjack-aggregator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now blackjack-aggregator.service
+#
+# Status checken:
+#   systemctl status blackjack-aggregator
+#   journalctl -u blackjack-aggregator -f
+#
+# Pfade in den Zeilen User= und WorkingDirectory= an die eigene
+# Installation anpassen.
+
+[Unit]
+Description=Blackjack Score-Aggregator (pollt die Spielstationen-Buckets)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/Documents/Projektarbeit-claude-sweet-mccarthy-ls269w
+ExecStart=/usr/bin/python3 -m scripts.score_aggregator
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

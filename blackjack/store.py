@@ -91,6 +91,18 @@ class LocalPlayerStore:
         p.balance = new_balance
         return new_balance
 
+    def set_balance(self, rfid_uid: str, balance: int) -> None:
+        """Setzt das Guthaben hart (z. B. nach DB-Lookup).
+
+        Legt den Spieler an, falls er noch nicht im Store existiert.
+        """
+        if rfid_uid in self._players:
+            self._players[rfid_uid].balance = balance
+        else:
+            self._players[rfid_uid] = Player(
+                rfid=rfid_uid, name=rfid_uid, balance=balance,
+            )
+
     # ------------------------------------------------------------------
     def find_by_name(self, name: str) -> Optional[Player]:
         """Bequemer Zugriff für den Auto-Login (Offline-Modus)."""
