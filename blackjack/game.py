@@ -81,6 +81,7 @@ class Game:
         num_decks: int = 6,
         min_bet: int = 10,
         on_balance_change: Optional[Callable[[Player, int], None]] = None,
+        on_round_end: Optional[Callable[[Player], None]] = None,
     ) -> None:
         self.deck = Deck(num_decks=num_decks)
         self.min_bet = min_bet
@@ -93,6 +94,8 @@ class Game:
         self.results: List[RoundResult] = []
         self.message: str = "Bitte RFID-Chip auflegen"
         self.on_balance_change = on_balance_change
+        # Nach jeder abgeschlossenen Runde aufgerufen (Spieler, nicht Delta).
+        self.on_round_end = on_round_end
         # Für die Deal-Animation: nächstmöglicher Aufdeck-Zeitpunkt.
         self._next_deal_at: float = 0.0
         # Session-Statistik: wieviele Runden hat der aktuelle Spieler
@@ -354,6 +357,10 @@ class Game:
 
         self.state = State.ROUND_OVER
         self.message = self._summary_message()
+
+        # Nach jeder Runde: Hook für externe Beobachter (z. B. DB-Write).
+        if self.on_round_end is not None and self.player is not None:
+            self.on_round_end(self.player)
 
     def _settle(
         self, hand: Hand, dealer_value: int, dealer_bj: bool, dealer_bust: bool

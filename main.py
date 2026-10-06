@@ -112,6 +112,7 @@ class App:
         self.game = Game(
             min_bet=args.min_bet,
             on_balance_change=self._on_balance_change,
+            on_round_end=self._on_round_end,
         )
         self.gui = BlackjackGUI(self.game)
         self.buttons = ButtonHandler(mode=args.input)
@@ -162,7 +163,8 @@ class App:
                 return
             if uid is None:
                 log.info("RFID abgemeldet")
-                self._finalize_current_session()
+                # Der aktuelle Score steht bereits in SpieloAutomat
+                # (nach jeder Runde über _on_round_end geschrieben).
                 self.game.logout()
             else:
                 self._login_by_uid(uid)
@@ -199,19 +201,16 @@ class App:
         log.info("Auto-Login: %s (Guthaben %d)", player.name, player.balance)
         self.game.login(player, default_bet=self.args.default_bet)
 
-    def _finalize_current_session(self) -> None:
-        """Session-Ende: aktuellen Kontostand in SpieloAutomat speichern."""
-        if self.game.player is None:
-            return
-        if self.game.session_plays <= 0:
-            return
+    def _on_round_end(self, player: Player) -> None:
+        """Wird nach jeder abgeschlossenen Runde aus Game aufgerufen.
+
+        Schreibt den aktuellen Kontostand des Spielers nach SpieloAutomat,
+        damit der neue Wert sofort für jeden Chip-Scan verfügbar ist.
+        """
         try:
-            influx_db.write_endscore(
-                self.game.player.rfid,
-                self.game.player.balance,
-            )
+            influx_db.write_endscore(player.rfid, player.balance)
         except Exception as e:
-            log.warning("write_endscore fehlgeschlagen: %s", e)
+            log.warning("write_endscore nach Runde fehlgeschlagen: %s", e)
 
     # ------------------------------------------------------------------
     # Taster
@@ -242,8 +241,8 @@ class App:
 
     # ------------------------------------------------------------------
     def _shutdown(self) -> None:
-        self._finalize_current_session()
-
+        # Der letzte Scorestand steht bereits nach der letzten Runde in
+        # SpieloAutomat - hier ist nichts weiter zu persistieren.
         try:
             self.buttons.close()
         except Exception:  # pragma: no cover

@@ -162,3 +162,36 @@ def test_balance_callback_receives_delta():
     # -25 (Einsatz) und +25 (Push-Rückzahlung)
     assert sum(seen) == 0
     assert seen[0] == -25
+
+
+def test_round_end_callback_runs_once_per_hand():
+    """on_round_end feuert nach jeder abgeschlossenen Runde, mit dem
+    finalen Kontostand des Spielers."""
+    seen = []
+
+    def cb(player):
+        seen.append(player.balance)
+
+    game = Game(on_round_end=cb)
+    # Erste Runde: Spieler K+9 (19) vs. Dealer 6+10, Dealer zieht Q (bust) -> WIN
+    game.deck = StackedDeck([
+        C("K"), C("6"), C("9"), C("10"), C("Q"),
+    ])
+    game.login(Player("uid", "Tester", 100), default_bet=25)
+    game.start_round()
+    assert seen == []           # noch kein Round-End
+    game.stand()
+    assert len(seen) == 1       # exakt einmal nach der Runde
+    assert seen[0] == 125       # 100 - 25 + 50 (Win-Auszahlung)
+
+
+def test_round_end_callback_not_called_mid_round():
+    """on_round_end feuert nicht beim Login oder im PLAYER_TURN."""
+    seen = []
+    game = Game(on_round_end=lambda p: seen.append(p.balance))
+    game.deck = StackedDeck([C("K"), C("6"), C("9"), C("10"), C("Q")])
+    game.login(Player("uid", "T", 100), default_bet=25)
+    assert seen == []
+    game.start_round()
+    assert seen == []           # Deal löst nicht aus
+    # Erst nach game.stand() würde die Runde enden.
