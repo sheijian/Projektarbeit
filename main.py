@@ -204,15 +204,24 @@ class App:
     def _on_round_end(self, player: Player) -> None:
         """Wird nach jeder abgeschlossenen Runde aus Game aufgerufen.
 
-        Schreibt den aktuellen Kontostand des Spielers nach SpieloAutomat,
-        damit der neue Wert sofort für jeden Chip-Scan verfügbar ist.
+        Schreibt den aktuellen Kontostand (und den Anzeigenamen) nach
+        SpieloAutomat, damit beides sofort beim nächsten Chip-Scan
+        bzw. in jeder Abfrage verfügbar ist.
         """
+        # Username nur mitgeben, wenn er ein echter Name ist - der
+        # Fallback-Name == UUID (wenn kein Anzeigename gefunden wurde)
+        # soll NICHT in das username-Field.
+        name = player.name if player.name and player.name != player.rfid else None
         log.info(
-            "Runde beendet - schreibe Score %d für user_id=%s nach SpieloAutomat",
-            player.balance, player.rfid,
+            "Runde beendet - schreibe Score %d%s für user_id=%s nach SpieloAutomat",
+            player.balance,
+            f" + username='{name}'" if name else "",
+            player.rfid,
         )
         try:
-            ok = influx_db.write_endscore(player.rfid, player.balance)
+            ok = influx_db.write_endscore(
+                player.rfid, player.balance, username=name,
+            )
             if not ok:
                 log.warning(
                     "write_endscore hat KEINEN Schreibvorgang durchgeführt - "

@@ -132,42 +132,78 @@ def test_escape_line_protocol_tag_spaces_commas_equals():
 # ---------------------------------------------------------------------------
 # write_endscore: schreibt den aktuellen Kontostand in SpieloAutomat
 # ---------------------------------------------------------------------------
-def test_write_endscore_uses_line_protocol():
-    cfg = InfluxConfig(
+class _CaptureSession:
+    def __init__(self):
+        self.captured = {}
+
+    def post(self, url, params=None, headers=None, data=None, timeout=None):
+        self.captured.update(
+            url=url, params=params, headers=headers,
+            body=data.decode("utf-8"),
+        )
+
+        class R:
+            ok = True
+            status_code = 200
+            text = ""
+
+        return R()
+
+
+def _test_cfg():
+    return InfluxConfig(
         url="http://example.local", org="o", bucket="SpieloAutomat",
         bucket_id="bi", token_read="tr", token_write="tw",
     )
 
-    captured = {}
 
-    class FakeResponse:
-        ok = True
-        status_code = 200
-        text = ""
-
-    class FakeSession:
-        def post(self, url, params=None, headers=None, data=None, timeout=None):
-            captured["url"] = url
-            captured["params"] = params
-            captured["headers"] = headers
-            captured["body"] = data.decode("utf-8")
-            return FakeResponse()
-
+def test_write_endscore_uses_line_protocol():
+    sess = _CaptureSession()
     assert write_endscore(
-        "d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb",
-        40,
-        cfg=cfg,
-        session=FakeSession(),
+        "d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb", 40,
+        cfg=_test_cfg(), session=sess,
     )
-    assert captured["url"] == "http://example.local/api/v2/write"
-    assert captured["params"] == {
+    assert sess.captured["url"] == "http://example.local/api/v2/write"
+    assert sess.captured["params"] == {
         "org": "o", "bucket": "SpieloAutomat", "precision": "ms",
     }
-    assert captured["headers"]["Authorization"] == "Token tw"
-    line = captured["body"].strip()
+    assert sess.captured["headers"]["Authorization"] == "Token tw"
+    line = sess.captured["body"].strip()
     assert line.startswith(
         "endscore,user_id=d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb score=40i "
     )
+
+
+def test_write_endscore_includes_username_field_when_given():
+    sess = _CaptureSession()
+    assert write_endscore(
+        "7c3ed021-5099-4d46-9283-002adf814597", 125,
+        username="Tobias",
+        cfg=_test_cfg(), session=sess,
+    )
+    line = sess.captured["body"].strip()
+    # score und username im selben Datenpunkt, Komma-separiert
+    assert (
+        "endscore,user_id=7c3ed021-5099-4d46-9283-002adf814597 "
+        'score=125i,username="Tobias" '
+    ) in line + " "
+
+
+def test_write_endscore_escapes_quotes_in_username():
+    sess = _CaptureSession()
+    assert write_endscore(
+        "uid-x", 10, username='A"B\\C', cfg=_test_cfg(), session=sess,
+    )
+    line = sess.captured["body"].strip()
+    assert r'username="A\"B\\C"' in line
+
+
+def test_write_endscore_without_username_only_writes_score():
+    sess = _CaptureSession()
+    assert write_endscore("uid-x", 10, cfg=_test_cfg(), session=sess)
+    line = sess.captured["body"].strip()
+    assert "username" not in line
+    assert "score=10i" in line
 
 
 def test_write_endscore_rejects_unconfigured_db():

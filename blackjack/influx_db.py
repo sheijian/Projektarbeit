@@ -60,10 +60,11 @@ INFLUX_TOKEN_WRITE = ""
 # Konstanten werden von query_points, write_endscore UND dem
 # scripts/score_aggregator.py benutzt. So bleibt alles konsistent.
 # ===========================================================================
-POINTS_BUCKET      = "SpieloAutomat"
-POINTS_MEASUREMENT = "endscore"
-POINTS_FIELD       = "score"
-POINTS_TAG         = "user_id"      # <-- Tag-Name im SpieloAutomat
+POINTS_BUCKET          = "SpieloAutomat"
+POINTS_MEASUREMENT     = "endscore"
+POINTS_FIELD           = "score"       # Integer-Field für den Punktestand
+POINTS_USERNAME_FIELD  = "username"    # String-Field für den Anzeigenamen
+POINTS_TAG             = "user_id"     # Tag-Name im SpieloAutomat
 # ===========================================================================
 
 
@@ -201,16 +202,17 @@ def query_username(
 def write_endscore(
     user_id: str,
     score: int,
+    username: Optional[str] = None,
     cfg: Optional[InfluxConfig] = None,
     session: Optional[requests.Session] = None,
 ) -> bool:
-    """Schreibt den aktuellen Kontostand des Spielers in SpieloAutomat.
+    """Schreibt den aktuellen Kontostand (und optional den Anzeigenamen)
+    nach SpieloAutomat.
 
     Wird nach jedem Blackjack-Spieldurchlauf aufgerufen, damit der neue
-    Wert sofort beim nächsten Chip-Scan sichtbar ist. Der Aggregator
-    merkt sich separat die Spielstationen-Summen und überschreibt den
-    hier geschriebenen Wert erst, wenn sich an den anderen Stationen
-    tatsächlich etwas ändert.
+    Wert sofort beim nächsten Chip-Scan sichtbar ist. Wenn ``username``
+    gesetzt ist, wird zusätzlich ein String-Field ``username`` im selben
+    Datenpunkt geschrieben - so hat man Punkte und Name an einem Ort.
     """
     cfg = cfg or _effective_config()
     if not cfg.is_configured:
@@ -221,10 +223,14 @@ def write_endscore(
         return False
 
     safe_uid = _escape_line_protocol_tag(user_id)
+    fields = [f"{POINTS_FIELD}={int(score)}i"]
+    if username:
+        safe_name = _escape_line_protocol_string(username)
+        fields.append(f'{POINTS_USERNAME_FIELD}="{safe_name}"')
     ts_ms = int(time.time() * 1000)
     line = (
         f"{POINTS_MEASUREMENT},{POINTS_TAG}={safe_uid} "
-        f"{POINTS_FIELD}={int(score)}i {ts_ms}\n"
+        f"{','.join(fields)} {ts_ms}\n"
     )
     log.debug(
         "write_endscore -> %s/api/v2/write?bucket=%s  LINE: %s",
@@ -394,3 +400,10 @@ def _escape_line_protocol_tag(value: str) -> str:
         .replace("=", r"\=")
         .replace(" ", r"\ ")
     )
+
+
+def _escape_line_protocol_string(value: str) -> str:
+    """Escaping für String-Field-Werte im Line-Protocol: Backslash und
+    doppelte Anführungszeichen müssen escaped werden. Der Aufrufer wrappt
+    den Rückgabewert mit \" \"."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
