@@ -200,22 +200,18 @@ class App:
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _finalize_current_session(self) -> None:
-        """Session-Ende: Delta + Winrate in den Bucket schreiben (TODO)."""
+        """Session-Ende: aktuellen Kontostand in SpieloAutomat speichern."""
         if self.game.player is None:
             return
         if self.game.session_plays <= 0:
             return
-        start = self.store.get_player(self.game.player.rfid).balance
-        delta = self.game.player.balance - start
         try:
-            influx_db.write_session_end(
+            influx_db.write_endscore(
                 self.game.player.rfid,
-                delta,
-                self.game.session_wins,
-                self.game.session_plays,
+                self.game.player.balance,
             )
         except Exception as e:
-            log.warning("write_session_end fehlgeschlagen: %s", e)
+            log.warning("write_endscore fehlgeschlagen: %s", e)
 
     # ------------------------------------------------------------------
     # Taster

@@ -17,6 +17,7 @@ import csv
 import io
 import logging
 import re
+import time
 from typing import Optional
 
 import requests
@@ -187,27 +188,62 @@ def query_username(
 
 
 # ---------------------------------------------------------------------------
-# Session-Ende
+# Endscore in SpieloAutomat schreiben
 # ---------------------------------------------------------------------------
-def write_session_end(
+def write_endscore(
     user_id: str,
-    delta: int,
-    wins: int,
-    plays: int,
+    score: int,
     cfg: Optional[InfluxConfig] = None,
     session: Optional[requests.Session] = None,
-) -> None:
-    """TODO: Endscore + Winrate nach Session-Ende in den Bucket schreiben.
+) -> bool:
+    """Schreibt den aktuellen Kontostand des Spielers in SpieloAutomat.
 
-    Platzhalter - sobald wir uns darauf einigen, in welchen Bucket die
-    Blackjack-Session-Ergebnisse zurückfließen sollen, kommt hier das
-    passende Line-Protocol-Write hin. Bis dahin wird nur geloggt, damit
-    man im Spiel sieht was geschrieben würde.
+    Wird nach jedem Blackjack-Spieldurchlauf aufgerufen, damit der neue
+    Wert sofort beim nächsten Chip-Scan sichtbar ist. Der Aggregator
+    merkt sich separat die Spielstationen-Summen und überschreibt den
+    hier geschriebenen Wert erst, wenn sich an den anderen Stationen
+    tatsächlich etwas ändert.
     """
-    log.info(
-        "write_session_end TODO: user_id=%s delta=%+d wins=%d plays=%d",
-        user_id, delta, wins, plays,
+    cfg = cfg or _effective_config()
+    if not cfg.is_configured:
+        log.warning("write_endscore: InfluxDB nicht konfiguriert")
+        return False
+
+    safe_uid = _escape_line_protocol_tag(user_id)
+    ts_ms = int(time.time() * 1000)
+    line = (
+        f"{POINTS_MEASUREMENT},{POINTS_TAG}={safe_uid} "
+        f"{POINTS_FIELD}={int(score)}i {ts_ms}\n"
     )
+
+    sess = session or _get_session()
+    try:
+        r = sess.post(
+            f"{cfg.url}/api/v2/write",
+            params={
+                "org": cfg.org,
+                "bucket": POINTS_BUCKET,
+                "precision": "ms",
+            },
+            headers={
+                "Authorization": f"Token {cfg.token_write}",
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            data=line.encode("utf-8"),
+            timeout=5,
+        )
+    except requests.RequestException as e:
+        log.warning("write_endscore: %s", e)
+        return False
+    if not r.ok:
+        log.warning(
+            "write_endscore HTTP %s: %s",
+            r.status_code, r.text[:120],
+        )
+        return False
+    log.info("write_endscore: user_id=%s score=%d (SpieloAutomat)",
+             user_id, score)
+    return True
 
 
 # ---------------------------------------------------------------------------

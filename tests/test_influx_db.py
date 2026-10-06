@@ -12,7 +12,7 @@ from blackjack.influx_db import (
     _escape_line_protocol_tag,
     _parse_flux_first_value,
     query_username,
-    write_session_end,
+    write_endscore,
 )
 
 
@@ -130,8 +130,66 @@ def test_escape_line_protocol_tag_spaces_commas_equals():
 
 
 # ---------------------------------------------------------------------------
-# Platzhalter: Session-Ende darf keinen Fehler werfen
+# write_endscore: schreibt den aktuellen Kontostand in SpieloAutomat
 # ---------------------------------------------------------------------------
-def test_write_session_end_is_noop_but_safe():
-    # Soll nur loggen und keine Exception werfen.
-    write_session_end("uid-x", delta=42, wins=3, plays=5)
+def test_write_endscore_uses_line_protocol():
+    cfg = InfluxConfig(
+        url="http://example.local", org="o", bucket="SpieloAutomat",
+        bucket_id="bi", token_read="tr", token_write="tw",
+    )
+
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        text = ""
+
+    class FakeSession:
+        def post(self, url, params=None, headers=None, data=None, timeout=None):
+            captured["url"] = url
+            captured["params"] = params
+            captured["headers"] = headers
+            captured["body"] = data.decode("utf-8")
+            return FakeResponse()
+
+    assert write_endscore(
+        "d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb",
+        40,
+        cfg=cfg,
+        session=FakeSession(),
+    )
+    assert captured["url"] == "http://example.local/api/v2/write"
+    assert captured["params"] == {
+        "org": "o", "bucket": "SpieloAutomat", "precision": "ms",
+    }
+    assert captured["headers"]["Authorization"] == "Token tw"
+    line = captured["body"].strip()
+    assert line.startswith(
+        "endscore,user_id=d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb score=40i "
+    )
+
+
+def test_write_endscore_rejects_unconfigured_db():
+    unconfigured = InfluxConfig(
+        url="", org="", bucket="", bucket_id="", token_read="", token_write="",
+    )
+    assert write_endscore("uid", 20, cfg=unconfigured) is False
+
+
+def test_write_endscore_returns_false_on_http_error():
+    cfg = InfluxConfig(
+        url="http://x", org="o", bucket="b",
+        bucket_id="bi", token_read="tr", token_write="tw",
+    )
+
+    class FailResponse:
+        ok = False
+        status_code = 500
+        text = "boom"
+
+    class FailSession:
+        def post(self, *a, **kw):
+            return FailResponse()
+
+    assert write_endscore("uid", 20, cfg=cfg, session=FailSession()) is False

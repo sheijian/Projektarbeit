@@ -93,11 +93,11 @@ anschließend im HUD als "Spieler: Jonathan". Als Fallback wird der
 
 Alle InfluxDB-Zugriffe stehen in einer einzigen Datei:
 
-| Funktion                          | Zweck                                                    |
-|-----------------------------------|----------------------------------------------------------|
-| `query_username(user_id)`         | Anzeigename aus Bucket **PPMaster** (last)               |
-| `query_points(user_id)`           | Guthaben aus Bucket **SpieloAutomat** (last, siehe unten)|
-| `write_session_end(...)`          | Session-Ergebnis zurückschreiben (noch TODO)           |
+| Funktion                          | Zweck                                                         |
+|-----------------------------------|---------------------------------------------------------------|
+| `query_username(user_id)`         | Anzeigename aus Bucket **PPMaster** (last)                    |
+| `query_points(user_id)`           | Guthaben aus Bucket **SpieloAutomat** (last, siehe unten)     |
+| `write_endscore(user_id, score)`  | Nach jedem Spieldurchlauf: neuen Kontostand in **SpieloAutomat** |
 
 Die Punkte-Abfrage sieht so aus:
 
@@ -110,7 +110,13 @@ from(bucket: "SpieloAutomat")
   |> last()
 ```
 
-Den Bucket `SpieloAutomat` füllt der Aggregator (siehe unten).
+Den Bucket `SpieloAutomat` füllt zweierlei:
+
+* der Aggregator (unten) – Summe aus allen sechs Spielstationen,
+* und Blackjack selbst – nach jeder Session wird der aktuelle
+  Kontostand als neuer `endscore,user_id=<uid> score=<neu>` geschrieben.
+  Beim nächsten Chip-Scan sieht `|> last()` sofort den aktualisierten
+  Wert.
 
 ## Score-Aggregator (Hintergrund-Dienst)
 
