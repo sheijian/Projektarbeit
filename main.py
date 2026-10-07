@@ -172,21 +172,35 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
 
-        # Startguthaben aus dem SpieloAutomat-Bucket (vom Aggregator
-        # befüllt). Fallback: --starting-balance.
+        # 1) Punktestand aus dem SpieloAutomat-Bucket.
         points = influx_db.query_points(uid)
-        if points is not None:
+        if points is None:
+            log.warning(
+                "SpieloAutomat kennt user_id=%s nicht - nehme Fallback %d",
+                uid, self.args.starting_balance,
+            )
+        else:
+            log.info("SpieloAutomat: user_id=%s -> Score %d", uid, points)
             self.store.set_balance(uid, points)
         player = self.store.get_player(uid)
 
-        # Username: zuerst aus der InfluxDB; Fallback = Name, den der
-        # ESP32-Reader selbst mitgeliefert hat.
+        # 2) Anzeigename aus dem PPMaster-Bucket.
         name = influx_db.query_username(uid)
-        if not name and isinstance(self.rfid, HTTPRFIDReader):
-            name = self.rfid.get_name_hint(uid)
+        if name:
+            log.info("PPMaster: user_id=%s -> username '%s'", uid, name)
+        else:
+            log.warning("PPMaster kennt user_id=%s nicht", uid)
+            if isinstance(self.rfid, HTTPRFIDReader):
+                name = self.rfid.get_name_hint(uid)
+                if name:
+                    log.info("Fallback: ESP32 lieferte username '%s'", name)
         if name:
             player.name = name
 
+        log.info(
+            "Login abgeschlossen: name=%s, balance=%d, uid=%s",
+            player.name, player.balance, player.rfid,
+        )
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _auto_login(self, name: str) -> None:
