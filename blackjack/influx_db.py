@@ -1,14 +1,14 @@
 """Alle InfluxDB-Zugriffe des Blackjack-Automaten.
 
-Hier liegt die komplette Datenbank-Logik an einem Ort - jede künftige
-Abfrage oder Schreib-Operation gehört in diese Datei.
+Drei Funktionen, mehr nicht:
 
-Datenmodell im Bucket:
+    query_score(user_id)              -> int | None    (aus SpieloAutomat)
+    query_username(user_id)           -> str | None    (aus PPMaster)
+    write_score(user_id, score, name) -> bool          (nach SpieloAutomat)
 
-    PPMaster,user_id=<uuid>  username="<name>"  <timestamp>
-
-Weitere Measurements (Punkte, Winrate etc.) folgen später - die
-entsprechenden Platzhalter stehen am Ende der Datei.
+Zugangsdaten (URL, Org, Tokens) stehen oben als Konstanten. Trage die
+Tokens direkt in dieser Datei ein - die Datei ist der einzige Ort, an
+dem DB-Credentials liegen.
 """
 
 from __future__ import annotations
@@ -16,13 +16,10 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import re
 import time
 from typing import Optional
 
 import requests
-
-from .db_config import INFLUX, InfluxConfig, load_influx_config
 
 
 log = logging.getLogger(__name__)
@@ -31,65 +28,38 @@ log = logging.getLogger(__name__)
 # ===========================================================================
 # InfluxDB-Zugangsdaten
 # ===========================================================================
-# Hier kannst du Server/Bucket/Tokens direkt eintragen. Die Werte unten
-# gewinnen gegenüber einer evtl. vorhandenen .env-Datei (sofern sie
-# nicht leer sind).
-#
-# WICHTIG: Wenn du die Tokens hier einträgst, pass auf, dass du die
-# Datei NICHT mit echten Tokens committest - sonst stehen sie im
-# öffentlichen Git-Repo. Entweder vor dem Commit wieder leer machen
-# oder stattdessen die .env-Lösung benutzen (siehe .env.example).
+# WICHTIG: Die Datei nicht mit echten Tokens committen - sonst stehen die
+# Tokens im öffentlichen Git-Repo.
 # ===========================================================================
 INFLUX_URL         = "http://10.0.244.254:8086"
 INFLUX_ORG         = "FIT244"
-INFLUX_BUCKET      = "PPMaster"
-INFLUX_BUCKET_ID   = "0a38c021dbad8b0c"
 
 # <<< HIER DEN LESE-TOKEN EINFÜGEN >>>
 INFLUX_TOKEN_READ  = ""
 
 # <<< HIER DEN SCHREIB-TOKEN EINFÜGEN >>>
 INFLUX_TOKEN_WRITE = ""
-# ===========================================================================
 
 
 # ===========================================================================
-# Schema des SpieloAutomat-Buckets
+# Schema: Zuordnung Bucket + Measurement + Field + Tag
 # ===========================================================================
-# Falls die DB mit anderen Namen eingerichtet ist, hier anpassen - diese
-# Konstanten werden von query_points, write_endscore UND dem
-# scripts/score_aggregator.py benutzt. So bleibt alles konsistent.
+# PPMaster speichert pro RFID-Chip den Anzeigenamen (gefüllt vom ESP32).
+USERNAME_BUCKET      = "PPMaster"
+USERNAME_MEASUREMENT = "PPMaster"
+USERNAME_FIELD       = "username"
+USERNAME_TAG         = "user_id"
+
+# SpieloAutomat ist unser gemeinsamer Punkte-Bucket (vom Aggregator
+# dauerhaft befüllt + von Blackjack nach jeder Hand aktualisiert).
+SCORE_BUCKET      = "SpieloAutomat"
+SCORE_MEASUREMENT = "endscore"
+SCORE_FIELD       = "score"       # int
+SCORE_NAME_FIELD  = "username"    # str (zusätzlich im selben Datenpunkt)
+SCORE_TAG         = "user_id"
 # ===========================================================================
-POINTS_BUCKET          = "SpieloAutomat"
-POINTS_MEASUREMENT     = "endscore"
-POINTS_FIELD           = "score"       # Integer-Field für den Punktestand
-POINTS_USERNAME_FIELD  = "username"    # String-Field für den Anzeigenamen
-POINTS_TAG             = "user_id"     # Tag-Name im SpieloAutomat
-# ===========================================================================
 
 
-def _effective_config() -> InfluxConfig:
-    """Nimmt die Konstanten oben, wenn sie gefüllt sind - sonst .env.
-
-    So kann man wahlweise den Token direkt in dieser Datei eintragen oder
-    (sauberer) in .env - beides funktioniert, Code gewinnt.
-    """
-    env = INFLUX
-    read_token  = INFLUX_TOKEN_READ  or env.token_read
-    write_token = INFLUX_TOKEN_WRITE or env.token_write
-    return InfluxConfig(
-        url=INFLUX_URL or env.url,
-        org=INFLUX_ORG or env.org,
-        bucket=INFLUX_BUCKET or env.bucket,
-        bucket_id=INFLUX_BUCKET_ID or env.bucket_id,
-        token_read=read_token,
-        token_write=write_token,
-    )
-
-
-# ---------------------------------------------------------------------------
-# HTTP-Session (lazy)
-# ---------------------------------------------------------------------------
 _session: Optional[requests.Session] = None
 
 
@@ -100,197 +70,128 @@ def _get_session() -> requests.Session:
     return _session
 
 
+def _is_configured() -> bool:
+    return bool(INFLUX_URL and INFLUX_ORG and INFLUX_TOKEN_READ)
+
+
 # ---------------------------------------------------------------------------
-# Username-Abfrage
+# Lesen
 # ---------------------------------------------------------------------------
-# Measurement/Field passen zum Beispiel-Export der PPMaster-Datenbank:
-#   ,_result,0,...,_time,_value,_field,_measurement
-#   ,_result,0,...,...,Jonathan,username,PPMaster
-USERNAME_MEASUREMENT = "PPMaster"
-USERNAME_FIELD = "username"
-USERNAME_TAG = "user_id"
-
-
-def query_points(
-    user_id: str,
-    cfg: Optional[InfluxConfig] = None,
-    session: Optional[requests.Session] = None,
-) -> Optional[int]:
-    """Liest den aktuellen Gesamt-Score aus dem SpieloAutomat-Bucket.
-
-    Die Werte dort werden vom Aggregator (``scripts/score_aggregator.py``)
-    aus den sechs anderen Spielstationen-Buckets zusammengerechnet.
-    """
-    cfg = cfg or _effective_config()
-    if not cfg.is_configured:
+def query_score(user_id: str) -> Optional[int]:
+    """Letzter ``score`` für ``user_id`` aus SpieloAutomat."""
+    if not _is_configured():
+        log.warning("query_score: InfluxDB nicht konfiguriert")
         return None
-
-    safe_id = _escape_flux_string(user_id)
     flux = (
-        f'from(bucket: "{POINTS_BUCKET}")\n'
+        f'from(bucket: "{SCORE_BUCKET}")\n'
         f'  |> range(start: 0)\n'
-        f'  |> filter(fn: (r) => r._measurement == "{POINTS_MEASUREMENT}")\n'
-        f'  |> filter(fn: (r) => r._field == "{POINTS_FIELD}")\n'
-        f'  |> filter(fn: (r) => r.{POINTS_TAG} == "{safe_id}")\n'
+        f'  |> filter(fn: (r) => r._measurement == "{SCORE_MEASUREMENT}")\n'
+        f'  |> filter(fn: (r) => r._field == "{SCORE_FIELD}")\n'
+        f'  |> filter(fn: (r) => r.{SCORE_TAG} == "{_esc_q(user_id)}")\n'
         f'  |> last()\n'
     )
-    log.debug("Influx query_points:\n%s", flux)
-    text = _run_query(flux, cfg, session)
-    if text is None:
-        return None
-    raw = _parse_flux_first_value(text)
+    raw = _run_query(flux)
     if raw is None:
-        log.info("Influx query_points(%s) -> noch kein Score", user_id)
+        return None
+    value = _first_value(raw)
+    if value is None:
+        log.info("query_score: kein Datenpunkt für user_id=%s in %s",
+                 user_id, SCORE_BUCKET)
         return None
     try:
-        points = int(float(raw))
+        score = int(float(value))
     except ValueError:
-        log.warning("Influx query_points: ungültiger Wert %r", raw)
+        log.warning("query_score: nicht-numerischer Wert %r", value)
         return None
-    log.info("Influx query_points(%s) -> %d", user_id, points)
-    return points
+    log.info("query_score: user_id=%s -> %d", user_id, score)
+    return score
 
 
-# ---------------------------------------------------------------------------
-# Username
-# ---------------------------------------------------------------------------
-def query_username(
-    user_id: str,
-    cfg: Optional[InfluxConfig] = None,
-    session: Optional[requests.Session] = None,
-) -> Optional[str]:
-    """Liest den Anzeigenamen zu einer RFID-UID aus dem PPMaster-Bucket.
-
-    Liefert ``None``, wenn kein Datenpunkt gefunden wurde oder die
-    Datenbank nicht konfiguriert / erreichbar ist. Fehler sind nicht
-    fatal - der Aufrufer kann auf den Namen vom ESP32-Reader zurück-
-    fallen.
-    """
-    cfg = cfg or _effective_config()
-    if not cfg.is_configured:
-        log.debug(
-            "query_username: InfluxDB nicht konfiguriert "
-            "(INFLUX_TOKEN_READ in blackjack/influx_db.py leer?)"
-        )
+def query_username(user_id: str) -> Optional[str]:
+    """Letzter ``username`` für ``user_id`` aus PPMaster."""
+    if not _is_configured():
         return None
-
-    safe_id = _escape_flux_string(user_id)
     flux = (
-        f'from(bucket: "{cfg.bucket}")\n'
+        f'from(bucket: "{USERNAME_BUCKET}")\n'
         f'  |> range(start: 0)\n'
         f'  |> filter(fn: (r) => r._measurement == "{USERNAME_MEASUREMENT}")\n'
         f'  |> filter(fn: (r) => r._field == "{USERNAME_FIELD}")\n'
-        f'  |> filter(fn: (r) => r.{USERNAME_TAG} == "{safe_id}")\n'
+        f'  |> filter(fn: (r) => r.{USERNAME_TAG} == "{_esc_q(user_id)}")\n'
         f'  |> last()\n'
     )
-    log.debug("Influx query_username:\n%s", flux)
-
-    text = _run_query(flux, cfg, session)
-    if text is None:
+    raw = _run_query(flux)
+    if raw is None:
         return None
-
-    name = _parse_flux_first_value(text)
-    log.info(
-        "Influx query_username(%s) -> %r", user_id, name,
-    )
+    name = _first_value(raw)
+    if name is None:
+        log.info("query_username: kein Datenpunkt für user_id=%s in %s",
+                 user_id, USERNAME_BUCKET)
+        return None
+    log.info("query_username: user_id=%s -> %r", user_id, name)
     return name
 
 
 # ---------------------------------------------------------------------------
-# Endscore in SpieloAutomat schreiben
+# Schreiben
 # ---------------------------------------------------------------------------
-def write_endscore(
+def write_score(
     user_id: str,
     score: int,
     username: Optional[str] = None,
-    cfg: Optional[InfluxConfig] = None,
-    session: Optional[requests.Session] = None,
 ) -> bool:
-    """Schreibt den aktuellen Kontostand (und optional den Anzeigenamen)
-    nach SpieloAutomat.
+    """Schreibt den aktuellen Kontostand nach SpieloAutomat.
 
-    Wird nach jedem Blackjack-Spieldurchlauf aufgerufen, damit der neue
-    Wert sofort beim nächsten Chip-Scan sichtbar ist. Wenn ``username``
-    gesetzt ist, wird zusätzlich ein String-Field ``username`` im selben
-    Datenpunkt geschrieben - so hat man Punkte und Name an einem Ort.
+    ``username`` ist optional; wenn gesetzt, kommt im selben Datenpunkt
+    ein zweites Field ``username`` dazu.
     """
-    cfg = cfg or _effective_config()
-    if not cfg.is_configured:
-        log.warning(
-            "write_endscore: InfluxDB nicht konfiguriert - "
-            "INFLUX_TOKEN_WRITE in blackjack/influx_db.py (oder .env) fehlt?"
-        )
+    if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
+        log.warning("write_score: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
         return False
 
-    safe_uid = _escape_line_protocol_tag(user_id)
-    fields = [f"{POINTS_FIELD}={int(score)}i"]
+    fields = [f"{SCORE_FIELD}={int(score)}i"]
     if username:
-        safe_name = _escape_line_protocol_string(username)
-        fields.append(f'{POINTS_USERNAME_FIELD}="{safe_name}"')
-    ts_ms = int(time.time() * 1000)
+        fields.append(f'{SCORE_NAME_FIELD}="{_esc_str(username)}"')
     line = (
-        f"{POINTS_MEASUREMENT},{POINTS_TAG}={safe_uid} "
-        f"{','.join(fields)} {ts_ms}\n"
+        f"{SCORE_MEASUREMENT},{SCORE_TAG}={_esc_tag(user_id)} "
+        f"{','.join(fields)} {int(time.time() * 1000)}\n"
     )
-    log.debug(
-        "write_endscore -> %s/api/v2/write?bucket=%s  LINE: %s",
-        cfg.url, POINTS_BUCKET, line.strip(),
-    )
+    log.debug("write_score -> %s/api/v2/write LINE: %s",
+              INFLUX_URL, line.strip())
 
-    sess = session or _get_session()
     try:
-        r = sess.post(
-            f"{cfg.url}/api/v2/write",
-            params={
-                "org": cfg.org,
-                "bucket": POINTS_BUCKET,
-                "precision": "ms",
-            },
+        r = _get_session().post(
+            f"{INFLUX_URL}/api/v2/write",
+            params={"org": INFLUX_ORG, "bucket": SCORE_BUCKET, "precision": "ms"},
             headers={
-                "Authorization": f"Token {cfg.token_write}",
+                "Authorization": f"Token {INFLUX_TOKEN_WRITE}",
                 "Content-Type": "text/plain; charset=utf-8",
             },
             data=line.encode("utf-8"),
             timeout=5,
         )
     except requests.RequestException as e:
-        log.warning("write_endscore: Netzwerkfehler: %s", e)
+        log.warning("write_score: Netzwerkfehler %s", e)
         return False
     if not r.ok:
-        log.warning(
-            "write_endscore HTTP %s - Antwort: %s | Line: %s",
-            r.status_code, r.text[:300], line.strip(),
-        )
+        log.warning("write_score HTTP %s: %s | LINE: %s",
+                    r.status_code, r.text[:200], line.strip())
         return False
-    log.info(
-        "write_endscore OK: user_id=%s score=%d (bucket=%s, measurement=%s, "
-        "tag=%s, field=%s)",
-        user_id, score, POINTS_BUCKET, POINTS_MEASUREMENT,
-        POINTS_TAG, POINTS_FIELD,
-    )
+    log.info("write_score OK: user_id=%s score=%d username=%r",
+             user_id, score, username)
     return True
 
 
 # ---------------------------------------------------------------------------
-# HTTP-Helfer
+# HTTP + Parser-Helfer
 # ---------------------------------------------------------------------------
-def _run_query(
-    flux: str,
-    cfg: InfluxConfig,
-    session: Optional[requests.Session] = None,
-) -> Optional[str]:
-    """Führt eine Flux-Query aus und liefert die rohe CSV-Antwort.
-
-    Netzwerk- und HTTP-Fehler werden nur geloggt - der Aufrufer bekommt
-    ``None`` zurück und kann entsprechend reagieren.
-    """
-    sess = session or _get_session()
+def _run_query(flux: str) -> Optional[str]:
+    log.debug("Flux:\n%s", flux)
     try:
-        r = sess.post(
-            f"{cfg.url}/api/v2/query",
-            params={"org": cfg.org},
+        r = _get_session().post(
+            f"{INFLUX_URL}/api/v2/query",
+            params={"org": INFLUX_ORG},
             headers={
-                "Authorization": f"Token {cfg.token_read}",
+                "Authorization": f"Token {INFLUX_TOKEN_READ}",
                 "Content-Type": "application/vnd.flux",
                 "Accept": "application/csv",
             },
@@ -298,68 +199,19 @@ def _run_query(
             timeout=5,
         )
     except requests.RequestException as e:
-        log.warning("Influx-Query fehlgeschlagen: %s", e)
+        log.warning("Flux-Query: Netzwerkfehler %s", e)
         return None
     if not r.ok:
-        log.warning("Influx HTTP %s: %s", r.status_code, r.text[:120])
+        log.warning("Flux-Query HTTP %s: %s", r.status_code, r.text[:200])
         return None
-    log.debug("Influx-Antwort (%d bytes): %s", len(r.text), r.text[:300])
+    log.debug("Flux-Antwort (%d bytes): %s", len(r.text), r.text[:300])
     return r.text
 
 
-# ---------------------------------------------------------------------------
-# Flux-CSV-Parser und Escaping
-# ---------------------------------------------------------------------------
-def parse_flux_grouped_sum(text: str, tag_name: str) -> dict[str, int]:
-    """Parst eine Flux-CSV mit mehreren Tabellen (eine pro Tag-Wert).
-
-    Liefert ``{tag_value: aggregierte_summe}`` - mehrfaches Auftauchen
-    desselben Tag-Werts wird addiert, nicht überschrieben.
-    """
-    result: dict[str, int] = {}
-    reader = csv.reader(io.StringIO(text))
-    value_idx: Optional[int] = None
-    tag_idx: Optional[int] = None
-    for row in reader:
-        if not row:
-            value_idx = tag_idx = None
-            continue
-        first = (row[0] or "").strip()
-        if first.startswith("#"):
-            value_idx = tag_idx = None
-            continue
-        if value_idx is None or tag_idx is None:
-            # Header-Kandidat.
-            try:
-                value_idx = row.index("_value")
-            except ValueError:
-                value_idx = None
-            try:
-                tag_idx = row.index(tag_name)
-            except ValueError:
-                tag_idx = None
-            continue
-        if value_idx >= len(row) or tag_idx >= len(row):
-            continue
-        tag_val = row[tag_idx].strip()
-        raw = row[value_idx].strip()
-        if not tag_val or not raw:
-            continue
-        try:
-            result[tag_val] = result.get(tag_val, 0) + int(float(raw))
-        except ValueError:
-            continue
-    return result
-
-
-def _parse_flux_first_value(text: str) -> Optional[str]:
-    """Extrahiert den ersten ``_value`` aus einer annotierten Flux-CSV.
-
-    Der Wert wird 1:1 als String zurückgegeben (Datentyp-Interpretation
-    liegt beim Aufrufer). Liefert ``None``, wenn keine Datenzeile mit
-    einer ``_value``-Spalte vorhanden ist.
-    """
-    reader = csv.reader(io.StringIO(text))
+def _first_value(csv_text: str) -> Optional[str]:
+    """Erste ``_value``-Zelle aus einer annotierten Flux-CSV. ``None``
+    wenn keine Datenzeile."""
+    reader = csv.reader(io.StringIO(csv_text))
     value_idx: Optional[int] = None
     for row in reader:
         if not row:
@@ -375,35 +227,26 @@ def _parse_flux_first_value(text: str) -> Optional[str]:
             except ValueError:
                 pass
             continue
-        if value_idx >= len(row):
-            continue
-        raw = row[value_idx].strip()
-        if raw:
-            return raw
+        if value_idx < len(row):
+            v = row[value_idx].strip()
+            if v:
+                return v
     return None
 
 
-def _escape_flux_string(value: str) -> str:
-    """Escaping für Werte innerhalb eines Flux-Strings (\" und \\)."""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+def _esc_q(s: str) -> str:
+    """Escaping für Werte in Flux-Strings."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# ---------------------------------------------------------------------------
-# Noch für später: Line-Protocol-Escape (Punkte-Schreiben)
-# ---------------------------------------------------------------------------
-def _escape_line_protocol_tag(value: str) -> str:
-    """Escaping für Tag-Werte im Line-Protocol: Kommas, Gleichzeichen und
-    Leerzeichen müssen mit Backslash escaped werden."""
-    return (
-        value.replace("\\", "\\\\")
-        .replace(",", r"\,")
-        .replace("=", r"\=")
-        .replace(" ", r"\ ")
-    )
+def _esc_tag(s: str) -> str:
+    """Escaping für Tag-Werte im Line-Protocol."""
+    return (s.replace("\\", "\\\\")
+             .replace(",", r"\,")
+             .replace("=", r"\=")
+             .replace(" ", r"\ "))
 
 
-def _escape_line_protocol_string(value: str) -> str:
-    """Escaping für String-Field-Werte im Line-Protocol: Backslash und
-    doppelte Anführungszeichen müssen escaped werden. Der Aufrufer wrappt
-    den Rückgabewert mit \" \"."""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+def _esc_str(s: str) -> str:
+    """Escaping für String-Field-Werte im Line-Protocol."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')

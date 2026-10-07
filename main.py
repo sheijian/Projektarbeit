@@ -95,18 +95,18 @@ class App:
         )
 
         # Zeige klar an, ob die InfluxDB-Verbindung bereit ist.
-        from blackjack.influx_db import _effective_config
-        cfg = _effective_config()
-        if cfg.is_configured:
+        if influx_db.INFLUX_TOKEN_READ:
             log.info(
-                "InfluxDB: %s (org=%s, bucket=%s) - bereit",
-                cfg.url, cfg.org, cfg.bucket,
+                "InfluxDB: %s (org=%s) - Score-Query aus '%s', "
+                "Username-Query aus '%s'",
+                influx_db.INFLUX_URL, influx_db.INFLUX_ORG,
+                influx_db.SCORE_BUCKET, influx_db.USERNAME_BUCKET,
             )
         else:
             log.warning(
-                "InfluxDB nicht konfiguriert - Username-Lookup inaktiv. "
-                "Trage den Lese-Token in blackjack/influx_db.py (ganz oben, "
-                "INFLUX_TOKEN_READ) oder in .env ein."
+                "InfluxDB nicht konfiguriert - trage INFLUX_TOKEN_READ "
+                "und INFLUX_TOKEN_WRITE ganz oben in "
+                "blackjack/influx_db.py ein."
             )
 
         self.game = Game(
@@ -172,34 +172,30 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
 
-        # 1) Punktestand aus dem SpieloAutomat-Bucket.
-        points = influx_db.query_points(uid)
-        if points is None:
+        # 1) Punktestand aus SpieloAutomat.
+        score = influx_db.query_score(uid)
+        if score is None:
             log.warning(
-                "SpieloAutomat kennt user_id=%s nicht - nehme Fallback %d",
+                "SpieloAutomat hat noch keinen Score für user_id=%s - "
+                "nehme Fallback %d",
                 uid, self.args.starting_balance,
             )
         else:
-            log.info("SpieloAutomat: user_id=%s -> Score %d", uid, points)
-            self.store.set_balance(uid, points)
+            self.store.set_balance(uid, score)
         player = self.store.get_player(uid)
 
-        # 2) Anzeigename aus dem PPMaster-Bucket.
+        # 2) Anzeigename aus PPMaster, Fallback ESP32.
         name = influx_db.query_username(uid)
-        if name:
-            log.info("PPMaster: user_id=%s -> username '%s'", uid, name)
-        else:
-            log.warning("PPMaster kennt user_id=%s nicht", uid)
-            if isinstance(self.rfid, HTTPRFIDReader):
-                name = self.rfid.get_name_hint(uid)
-                if name:
-                    log.info("Fallback: ESP32 lieferte username '%s'", name)
+        if not name and isinstance(self.rfid, HTTPRFIDReader):
+            name = self.rfid.get_name_hint(uid)
+            if name:
+                log.info("Fallback: ESP32 lieferte username %r", name)
         if name:
             player.name = name
 
         log.info(
-            "Login abgeschlossen: name=%s, balance=%d, uid=%s",
-            player.name, player.balance, player.rfid,
+            "Login: user_id=%s | name=%s | balance=%d",
+            player.rfid, player.name, player.balance,
         )
         self.game.login(player, default_bet=self.args.default_bet)
 
@@ -216,33 +212,15 @@ class App:
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
-        """Wird nach jeder abgeschlossenen Runde aus Game aufgerufen.
-
-        Schreibt den aktuellen Kontostand (und den Anzeigenamen) nach
-        SpieloAutomat, damit beides sofort beim nächsten Chip-Scan
-        bzw. in jeder Abfrage verfügbar ist.
-        """
+        """Nach jeder Hand den aktuellen Guthabenstand nach SpieloAutomat
+        schreiben (Live-Daten)."""
         # Username nur mitgeben, wenn er ein echter Name ist - der
-        # Fallback-Name == UUID (wenn kein Anzeigename gefunden wurde)
-        # soll NICHT in das username-Field.
+        # Fallback-Name == UUID soll NICHT ins username-Field.
         name = player.name if player.name and player.name != player.rfid else None
-        log.info(
-            "Runde beendet - schreibe Score %d%s für user_id=%s nach SpieloAutomat",
-            player.balance,
-            f" + username='{name}'" if name else "",
-            player.rfid,
-        )
         try:
-            ok = influx_db.write_endscore(
-                player.rfid, player.balance, username=name,
-            )
-            if not ok:
-                log.warning(
-                    "write_endscore hat KEINEN Schreibvorgang durchgeführt - "
-                    "Token ok? Schreibrechte auf SpieloAutomat? Siehe DEBUG-Log."
-                )
+            influx_db.write_score(player.rfid, player.balance, username=name)
         except Exception as e:
-            log.warning("write_endscore nach Runde fehlgeschlagen: %s", e)
+            log.warning("write_score nach Runde fehlgeschlagen: %s", e)
 
     # ------------------------------------------------------------------
     # Taster

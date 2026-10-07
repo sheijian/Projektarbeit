@@ -10,6 +10,5 @@ __all__ = [
     "rfid",
     "store",
     "influx_db",
-    "db_config",
     "config",
 ]

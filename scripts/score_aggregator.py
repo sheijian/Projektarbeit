@@ -1,15 +1,15 @@
 """Score-Aggregator - läuft dauerhaft auf dem Raspberry Pi.
 
-Pollt im festen Intervall (Default 5 s) die sechs Spielstationen-Buckets,
-summiert pro ``user_id`` die Endscores und schreibt den Gesamtscore in
-den gemeinsamen Bucket ``SpieloAutomat``. Von dort wird der Wert von
-jedem Blackjack-Login über ``influx_db.query_points`` gelesen.
+Pollt alle 5 Sekunden die sechs Spielstationen-Buckets, summiert pro
+``user_id`` und schreibt den Gesamtscore in den gemeinsamen Bucket
+``SpieloAutomat``.
 
-Aufruf (zum Testen):
+Aufruf:
+    python -m scripts.score_aggregator            # Dauerlauf
+    python -m scripts.score_aggregator --once     # ein Durchlauf
+    python -m scripts.score_aggregator --verbose  # alles mitloggen
 
-    python -m scripts.score_aggregator --verbose
-
-Als Dienst im Hintergrund: siehe scripts/blackjack-aggregator.service.
+Als Hintergrund-Dienst: siehe scripts/blackjack-aggregator.service.
 """
 
 from __future__ import annotations
@@ -25,22 +25,23 @@ from typing import Dict, List, Tuple
 import requests
 
 from blackjack.influx_db import (
-    POINTS_BUCKET,
-    POINTS_FIELD,
-    POINTS_MEASUREMENT,
-    POINTS_TAG,
-    _effective_config,
-    _escape_line_protocol_tag,
-    parse_flux_grouped_sum,
+    INFLUX_ORG,
+    INFLUX_TOKEN_READ,
+    INFLUX_TOKEN_WRITE,
+    INFLUX_URL,
+    SCORE_BUCKET,
+    SCORE_FIELD,
+    SCORE_MEASUREMENT,
+    SCORE_TAG,
+    _esc_tag,
 )
 
 
-log = logging.getLogger("score_aggregator")
+log = logging.getLogger("aggregator")
 
 
 # ---------------------------------------------------------------------------
-# Die sechs Quell-Buckets der anderen Gruppen.
-#   (bucket, measurement, field, tag_name)
+# Die sechs Quell-Buckets (bucket, measurement, field, tag_name).
 # ---------------------------------------------------------------------------
 SOURCE_BUCKETS: List[Tuple[str, str, str, str]] = [
     ("HeisserDraht",     "Endscore",            "Endscore",      "userID"),
@@ -53,183 +54,155 @@ SOURCE_BUCKETS: List[Tuple[str, str, str, str]] = [
 
 
 # ---------------------------------------------------------------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--interval", type=float, default=5.0,
-        help="Sekunden zwischen zwei Durchläufen (Default 5).",
-    )
-    p.add_argument(
-        "--range", default="0",
-        help="Flux-Range für die Summierung (z. B. '-1h', Default: 0 = seit "
-             "Beginn).",
-    )
-    p.add_argument(
-        "--once", action="store_true",
-        help="Nur ein Durchlauf, dann beenden (für Tests / Debugging).",
-    )
-    p.add_argument("--verbose", "-v", action="store_true")
-    return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-def query_bucket_sums(
-    session: requests.Session,
-    cfg,
-    bucket: str,
-    measurement: str,
-    field: str,
-    tag_name: str,
-    range_: str = "0",
-) -> Dict[str, int]:
-    """Summiert pro ``tag_name``-Wert alle Punkte eines Buckets."""
-    flux = (
-        f'from(bucket: "{bucket}")\n'
-        f'  |> range(start: {range_})\n'
-        f'  |> filter(fn: (r) => r._measurement == "{measurement}")\n'
-        f'  |> filter(fn: (r) => r._field == "{field}")\n'
-        f'  |> group(columns: ["{tag_name}"])\n'
-        f'  |> sum()\n'
-    )
-    try:
-        r = session.post(
-            f"{cfg.url}/api/v2/query",
-            params={"org": cfg.org},
-            headers={
-                "Authorization": f"Token {cfg.token_read}",
-                "Content-Type": "application/vnd.flux",
-                "Accept": "application/csv",
-            },
-            data=flux.encode("utf-8"),
-            timeout=5,
+def collect_totals(session: requests.Session) -> Dict[str, int]:
+    """Fragt alle sechs Buckets ab und addiert pro user_id."""
+    totals: Dict[str, int] = defaultdict(int)
+    for bucket, meas, field, tag in SOURCE_BUCKETS:
+        flux = (
+            f'from(bucket: "{bucket}")\n'
+            f'  |> range(start: 0)\n'
+            f'  |> filter(fn: (r) => r._measurement == "{meas}")\n'
+            f'  |> filter(fn: (r) => r._field == "{field}")\n'
+            f'  |> group(columns: ["{tag}"])\n'
+            f'  |> sum()\n'
         )
-    except requests.RequestException as e:
-        log.warning("Bucket %s: Query fehlgeschlagen: %s", bucket, e)
-        return {}
-    if not r.ok:
-        log.warning("Bucket %s: HTTP %s: %s",
-                    bucket, r.status_code, r.text[:120])
-        return {}
-    sums = parse_flux_grouped_sum(r.text, tag_name)
-    log.debug("Bucket %s: %d User", bucket, len(sums))
-    return sums
+        try:
+            r = session.post(
+                f"{INFLUX_URL}/api/v2/query",
+                params={"org": INFLUX_ORG},
+                headers={
+                    "Authorization": f"Token {INFLUX_TOKEN_READ}",
+                    "Content-Type": "application/vnd.flux",
+                    "Accept": "application/csv",
+                },
+                data=flux.encode("utf-8"),
+                timeout=5,
+            )
+        except requests.RequestException as e:
+            log.warning("Bucket %s: Netzwerkfehler %s", bucket, e)
+            continue
+        if not r.ok:
+            log.warning("Bucket %s: HTTP %s: %s",
+                        bucket, r.status_code, r.text[:120])
+            continue
+        for uid, score in _parse_grouped(r.text, tag).items():
+            uid = uid.strip()
+            if uid:
+                totals[uid] += score
+        log.debug("Bucket %s: %d Punkte-Zeilen", bucket, len(r.text.splitlines()))
+    return dict(totals)
 
 
-# ---------------------------------------------------------------------------
 def write_totals(
     session: requests.Session,
-    cfg,
     totals: Dict[str, int],
 ) -> bool:
-    """Schreibt pro user_id einen endscore-Datenpunkt in SpieloAutomat."""
+    """Schreibt pro user_id einen Datenpunkt in SpieloAutomat."""
     if not totals:
         return True
     ts_ms = int(time.time() * 1000)
-    lines = []
-    for uid, score in totals.items():
-        safe_uid = _escape_line_protocol_tag(uid)
-        lines.append(
-            f"{POINTS_MEASUREMENT},{POINTS_TAG}={safe_uid} "
-            f"{POINTS_FIELD}={int(score)}i {ts_ms}"
-        )
+    lines = [
+        f"{SCORE_MEASUREMENT},{SCORE_TAG}={_esc_tag(uid)} "
+        f"{SCORE_FIELD}={int(score)}i {ts_ms}"
+        for uid, score in totals.items()
+    ]
     body = "\n".join(lines) + "\n"
     try:
         r = session.post(
-            f"{cfg.url}/api/v2/write",
-            params={
-                "org": cfg.org,
-                "bucket": POINTS_BUCKET,
-                "precision": "ms",
-            },
+            f"{INFLUX_URL}/api/v2/write",
+            params={"org": INFLUX_ORG, "bucket": SCORE_BUCKET, "precision": "ms"},
             headers={
-                "Authorization": f"Token {cfg.token_write}",
+                "Authorization": f"Token {INFLUX_TOKEN_WRITE}",
                 "Content-Type": "text/plain; charset=utf-8",
             },
             data=body.encode("utf-8"),
             timeout=5,
         )
     except requests.RequestException as e:
-        log.warning("SpieloAutomat-Write fehlgeschlagen: %s", e)
+        log.warning("Write-Request fehlgeschlagen: %s", e)
         return False
     if not r.ok:
         log.warning("SpieloAutomat-Write HTTP %s: %s",
-                    r.status_code, r.text[:120])
+                    r.status_code, r.text[:200])
         return False
-    log.info("SpieloAutomat: %d User-Scores aktualisiert", len(totals))
+    log.info("SpieloAutomat: %d User aktualisiert", len(totals))
     return True
 
 
-# ---------------------------------------------------------------------------
-def collect_totals(
-    session: requests.Session,
-    cfg,
-    range_: str,
-) -> Dict[str, int]:
-    """Fragt alle sechs Buckets ab und addiert pro user_id."""
-    totals: Dict[str, int] = defaultdict(int)
-    for bucket, meas, field, tag in SOURCE_BUCKETS:
-        for uid, score in query_bucket_sums(
-            session, cfg, bucket, meas, field, tag, range_=range_,
-        ).items():
-            uid = uid.strip()
-            if uid:
-                totals[uid] += score
-    return dict(totals)
+def _parse_grouped(csv_text: str, tag_name: str) -> Dict[str, int]:
+    """Parst eine Flux-CSV mit group+sum, liefert {tag_value: _value}."""
+    import csv
+    import io
+
+    result: Dict[str, int] = {}
+    reader = csv.reader(io.StringIO(csv_text))
+    value_idx = tag_idx = None
+    for row in reader:
+        if not row:
+            value_idx = tag_idx = None
+            continue
+        if (row[0] or "").strip().startswith("#"):
+            value_idx = tag_idx = None
+            continue
+        if value_idx is None or tag_idx is None:
+            try:
+                value_idx = row.index("_value")
+            except ValueError:
+                value_idx = None
+            try:
+                tag_idx = row.index(tag_name)
+            except ValueError:
+                tag_idx = None
+            continue
+        if value_idx >= len(row) or tag_idx >= len(row):
+            continue
+        tag_val = row[tag_idx].strip()
+        raw = row[value_idx].strip()
+        if not tag_val or not raw:
+            continue
+        try:
+            result[tag_val] = result.get(tag_val, 0) + int(float(raw))
+        except ValueError:
+            continue
+    return result
 
 
 # ---------------------------------------------------------------------------
 def main() -> int:
-    args = parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--once", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true")
+    args = p.parse_args()
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    cfg = _effective_config()
-    if not cfg.is_configured:
-        log.error(
-            "InfluxDB nicht konfiguriert. INFLUX_TOKEN_READ und "
-            "INFLUX_TOKEN_WRITE in blackjack/influx_db.py (oder in .env) "
-            "setzen."
-        )
+    if not INFLUX_URL or not INFLUX_TOKEN_READ or not INFLUX_TOKEN_WRITE:
+        log.error("InfluxDB nicht konfiguriert. Trage URL/Tokens in "
+                  "blackjack/influx_db.py ganz oben ein.")
         return 1
-    log.info(
-        "Aggregator startet - %s, Intervall %.1fs, range=%s",
-        cfg.url, args.interval, args.range,
-    )
 
+    log.info("Aggregator startet - %s, Intervall %.1fs", INFLUX_URL, args.interval)
     sess = requests.Session()
     stop = {"flag": False}
-
-    def _handle_signal(signum, _frame):
-        log.info("Signal %s empfangen - beende", signum)
-        stop["flag"] = True
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    # Cache: nur schreiben, wenn sich der Score eines Users geändert hat.
-    last_scores: Dict[str, int] = {}
+    signal.signal(signal.SIGINT,  lambda *_: stop.update(flag=True))
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(flag=True))
 
     while not stop["flag"]:
         try:
-            totals = collect_totals(sess, cfg, args.range)
-            changed = {
-                uid: score for uid, score in totals.items()
-                if last_scores.get(uid) != score
-            }
-            if changed:
-                if write_totals(sess, cfg, changed):
-                    last_scores.update(changed)
+            totals = collect_totals(sess)
+            if totals:
+                write_totals(sess, totals)
             else:
-                log.debug("Nichts verändert (%d User überwacht)", len(totals))
+                log.debug("Noch keine Daten in den Quell-Buckets.")
         except Exception as e:  # pragma: no cover
             log.exception("Aggregator-Fehler: %s", e)
 
         if args.once:
             break
-
-        # schlafen, aber zwischendurch auf Stop-Signal reagieren.
         for _ in range(int(args.interval * 10)):
             if stop["flag"]:
                 break
