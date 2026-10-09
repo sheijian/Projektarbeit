@@ -117,6 +117,10 @@ class App:
         self.gui = BlackjackGUI(self.game)
         self.buttons = ButtonHandler(mode=args.input)
 
+        # Kontostand, der zuletzt erfolgreich in SpieloAutomat stand. Die
+        # Differenz dazu geht nach jeder Hand als Blackjack-Delta in die DB.
+        self._saved_balance: Optional[int] = None
+
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
             self.rfid: Optional[HTTPRFIDReader] = None
@@ -197,6 +201,7 @@ class App:
             "Login: user_id=%s | name=%s | balance=%d",
             player.rfid, player.name, player.balance,
         )
+        self._saved_balance = player.balance
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _auto_login(self, name: str) -> None:
@@ -209,18 +214,33 @@ class App:
             log.warning("Auto-Login: Spieler '%s' unbekannt", name)
             return
         log.info("Auto-Login: %s (Guthaben %d)", player.name, player.balance)
+        self._saved_balance = player.balance
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
-        """Nach jeder Hand den aktuellen Guthabenstand nach SpieloAutomat
-        schreiben (Live-Daten)."""
+        """Nach jeder Hand den aktuellen Guthabenstand plus den Gewinn/
+        Verlust seit dem letzten Write nach SpieloAutomat schreiben.
+
+        Das Delta braucht der Aggregator: Er rechnet den Gesamtstand
+        immer neu aus (Stationen + Blackjack-Deltas). Ohne Delta würde er
+        den Blackjack-Stand nach wenigen Sekunden wieder überschreiben.
+        """
         # Username nur mitgeben, wenn er ein echter Name ist - der
         # Fallback-Name == UUID soll NICHT ins username-Field.
         name = player.name if player.name and player.name != player.rfid else None
+        saved = player.balance if self._saved_balance is None else self._saved_balance
+        delta = player.balance - saved
         try:
-            influx_db.write_score(player.rfid, player.balance, username=name)
+            ok = influx_db.write_score(
+                player.rfid, player.balance, username=name, delta=delta,
+            )
         except Exception as e:
             log.warning("write_score nach Runde fehlgeschlagen: %s", e)
+            ok = False
+        # Nur bei Erfolg weiterschieben - sonst geht das Delta beim
+        # nächsten Write mit.
+        if ok:
+            self._saved_balance = player.balance
 
     # ------------------------------------------------------------------
     # Taster

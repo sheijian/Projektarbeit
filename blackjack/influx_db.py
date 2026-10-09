@@ -2,9 +2,9 @@
 
 Drei Funktionen, mehr nicht:
 
-    query_score(user_id)              -> int | None    (aus SpieloAutomat)
-    query_username(user_id)           -> str | None    (aus PPMaster)
-    write_score(user_id, score, name) -> bool          (nach SpieloAutomat)
+    query_score(user_id)                     -> int | None  (aus SpieloAutomat)
+    query_username(user_id)                  -> str | None  (aus PPMaster)
+    write_score(user_id, score, name, delta) -> bool        (nach SpieloAutomat)
 
 Zugangsdaten (URL, Org, Tokens) stehen oben als Konstanten. Trage die
 Tokens direkt in dieser Datei ein - die Datei ist der einzige Ort, an
@@ -57,6 +57,13 @@ SCORE_MEASUREMENT = "endscore"
 SCORE_FIELD       = "score"       # int
 SCORE_NAME_FIELD  = "username"    # str (zusätzlich im selben Datenpunkt)
 SCORE_TAG         = "user_id"
+
+# Gewinn/Verlust jeder Blackjack-Hand, ebenfalls in SpieloAutomat. Der
+# Aggregator summiert diese Deltas zu den Punkten der sechs Stationen -
+# sonst würde er den Blackjack-Stand alle paar Sekunden mit der reinen
+# Stationssumme überschreiben.
+DELTA_MEASUREMENT = "blackjack"
+DELTA_FIELD       = "delta"       # int, z. B. -10 oder +25
 # ===========================================================================
 
 
@@ -138,24 +145,35 @@ def write_score(
     user_id: str,
     score: int,
     username: Optional[str] = None,
+    delta: Optional[int] = None,
 ) -> bool:
     """Schreibt den aktuellen Kontostand nach SpieloAutomat.
 
     ``username`` ist optional; wenn gesetzt, kommt im selben Datenpunkt
     ein zweites Field ``username`` dazu.
+
+    ``delta`` ist der Blackjack-Gewinn/-Verlust seit dem letzten Write.
+    Wenn gesetzt, geht im selben Request ein ``blackjack``-Datenpunkt
+    mit, den der Aggregator in die Gesamtsumme einrechnet.
     """
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
         log.warning("write_score: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
         return False
 
+    ts_ms = int(time.time() * 1000)
     fields = [f"{SCORE_FIELD}={int(score)}i"]
     if username:
         fields.append(f'{SCORE_NAME_FIELD}="{_esc_str(username)}"')
     line = (
         f"{SCORE_MEASUREMENT},{SCORE_TAG}={_esc_tag(user_id)} "
-        f"{','.join(fields)} {int(time.time() * 1000)}\n"
+        f"{','.join(fields)} {ts_ms}\n"
     )
-    log.debug("write_score -> %s/api/v2/write LINE: %s",
+    if delta is not None:
+        line += (
+            f"{DELTA_MEASUREMENT},{SCORE_TAG}={_esc_tag(user_id)} "
+            f"{DELTA_FIELD}={int(delta)}i {ts_ms}\n"
+        )
+    log.debug("write_score -> %s/api/v2/write LINES: %s",
               INFLUX_URL, line.strip())
 
     try:
@@ -176,8 +194,8 @@ def write_score(
         log.warning("write_score HTTP %s: %s | LINE: %s",
                     r.status_code, r.text[:200], line.strip())
         return False
-    log.info("write_score OK: user_id=%s score=%d username=%r",
-             user_id, score, username)
+    log.info("write_score OK: user_id=%s score=%d delta=%s username=%r",
+             user_id, score, delta, username)
     return True
 
 

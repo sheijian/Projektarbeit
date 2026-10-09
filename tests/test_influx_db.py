@@ -191,6 +191,27 @@ def test_write_score_escapes_quotes_in_username():
     assert r'username="A\"B\\C"' in line
 
 
+def test_write_score_without_delta_writes_only_endscore():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_score("uid", 10)
+    lines = sess.calls[0]["body"].strip().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("endscore,")
+
+
+def test_write_score_adds_blackjack_delta_point():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_score("abc-uid", 1, delta=-20)
+    lines = sess.calls[0]["body"].strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("endscore,user_id=abc-uid score=1i ")
+    assert lines[1].startswith("blackjack,user_id=abc-uid delta=-20i ")
+    # Beide Punkte mit identischem Zeitstempel.
+    assert lines[0].rsplit(" ", 1)[1] == lines[1].rsplit(" ", 1)[1]
+
+
 def test_write_score_returns_false_when_not_configured():
     old = influx_db.INFLUX_TOKEN_WRITE
     influx_db.INFLUX_TOKEN_WRITE = ""

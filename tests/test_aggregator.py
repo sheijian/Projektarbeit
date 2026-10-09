@@ -143,3 +143,63 @@ def test_write_totals_handles_http_error():
     sess = _FakeSession(writes_ok=False)
     with _test_env():
         assert agg.write_totals(sess, {"alice": 10}) is False
+
+
+def test_collect_totals_includes_blackjack_deltas():
+    """Blackjack-Gewinne/-Verluste aus SpieloAutomat zählen mit - sonst
+    überschreibt der Aggregator den Blackjack-Stand mit der Stationssumme."""
+    uid = "7c3ed021-5099-4d46-9283-002adf814597"
+    responses = {
+        "HeisserDraht":  _csv("userID", uid, 21),
+        "SpieloAutomat": _csv("user_id", uid, -20),
+    }
+    sess = _FakeSession(responses)
+    with _test_env():
+        totals = agg.collect_totals(sess)
+    assert totals == {uid: 1}
+    assert "SpieloAutomat" in sess.queries
+
+
+def test_blackjack_source_matches_main_write():
+    assert agg.BLACKJACK_SOURCE == (
+        "SpieloAutomat", "blackjack", "delta", "user_id",
+    )
+
+
+def test_run_once_writes_only_changed_users():
+    responses = {
+        "HeisserDraht": (
+            "#datatype,string,long,string,long\r\n"
+            "#group,false,false,true,false\r\n"
+            "#default,_result,,,\r\n"
+            ",result,table,userID,_value\r\n"
+            ",,0,alice,21\r\n"
+            ",,1,bob,50\r\n"
+        ),
+    }
+    sess = _FakeSession(responses)
+    last_written = {"alice": 21}
+    with _test_env():
+        assert agg.run_once(sess, last_written) == {"bob": 50}
+    assert len(sess.writes) == 1
+    assert len(sess.writes[0]["lines"]) == 1
+    assert sess.writes[0]["lines"][0].startswith("endscore,user_id=bob ")
+    assert last_written == {"alice": 21, "bob": 50}
+
+
+def test_run_once_skips_write_when_nothing_changed():
+    sess = _FakeSession({"HeisserDraht": _csv("userID", "alice", 21)})
+    last_written = {"alice": 21}
+    with _test_env():
+        assert agg.run_once(sess, last_written) == {}
+    assert sess.writes == []
+
+
+def test_run_once_keeps_state_on_write_error():
+    sess = _FakeSession(
+        {"HeisserDraht": _csv("userID", "alice", 21)}, writes_ok=False,
+    )
+    last_written = {}
+    with _test_env():
+        assert agg.run_once(sess, last_written) is None
+    assert last_written == {}

@@ -1,8 +1,9 @@
 """Score-Aggregator - läuft dauerhaft auf dem Raspberry Pi.
 
-Pollt alle 5 Sekunden die sechs Spielstationen-Buckets, summiert pro
-``user_id`` und schreibt den Gesamtscore in den gemeinsamen Bucket
-``SpieloAutomat``.
+Pollt alle 5 Sekunden die sechs Spielstationen-Buckets plus die
+Blackjack-Gewinne/-Verluste, summiert pro ``user_id`` und schreibt den
+Gesamtscore in den gemeinsamen Bucket ``SpieloAutomat`` - aber nur für
+User, deren Summe sich seit dem letzten Write geändert hat.
 
 Aufruf:
     python -m scripts.score_aggregator            # Dauerlauf
@@ -20,11 +21,13 @@ import signal
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
 from blackjack.influx_db import (
+    DELTA_FIELD,
+    DELTA_MEASUREMENT,
     INFLUX_ORG,
     INFLUX_TOKEN_READ,
     INFLUX_TOKEN_WRITE,
@@ -52,12 +55,20 @@ SOURCE_BUCKETS: List[Tuple[str, str, str, str]] = [
     ("Gedaechtnistest",  "endscore",            "endscore",      "user_id"),
 ]
 
+# Gewinn/Verlust jeder Blackjack-Hand (von main.py geschrieben). Ohne diese
+# Quelle würde der Aggregator den Blackjack-Stand mit der reinen
+# Stationssumme überschreiben.
+BLACKJACK_SOURCE: Tuple[str, str, str, str] = (
+    SCORE_BUCKET, DELTA_MEASUREMENT, DELTA_FIELD, SCORE_TAG,
+)
+
 
 # ---------------------------------------------------------------------------
 def collect_totals(session: requests.Session) -> Dict[str, int]:
-    """Fragt alle sechs Buckets ab und addiert pro user_id."""
+    """Fragt alle sechs Buckets + die Blackjack-Deltas ab und addiert pro
+    user_id."""
     totals: Dict[str, int] = defaultdict(int)
-    for bucket, meas, field, tag in SOURCE_BUCKETS:
+    for bucket, meas, field, tag in (*SOURCE_BUCKETS, BLACKJACK_SOURCE):
         flux = (
             f'from(bucket: "{bucket}")\n'
             f'  |> range(start: 0)\n'
@@ -129,6 +140,30 @@ def write_totals(
     return True
 
 
+def run_once(
+    session: requests.Session,
+    last_written: Dict[str, int],
+) -> Optional[Dict[str, int]]:
+    """Ein Durchlauf: Summen holen und nur geänderte User schreiben.
+
+    ``last_written`` merkt sich pro user_id den zuletzt geschriebenen
+    Gesamtstand und wird nach erfolgreichem Write aktualisiert. Liefert
+    die geschriebenen Summen (``None`` bei Write-Fehler).
+    """
+    totals = collect_totals(session)
+    changed = {
+        uid: score for uid, score in totals.items()
+        if last_written.get(uid) != score
+    }
+    if not changed:
+        log.debug("Keine Änderungen (%d User).", len(totals))
+        return {}
+    if not write_totals(session, changed):
+        return None
+    last_written.update(changed)
+    return changed
+
+
 def _parse_grouped(csv_text: str, tag_name: str) -> Dict[str, int]:
     """Parst eine Flux-CSV mit group+sum, liefert {tag_value: _value}."""
     import csv
@@ -191,13 +226,10 @@ def main() -> int:
     signal.signal(signal.SIGINT,  lambda *_: stop.update(flag=True))
     signal.signal(signal.SIGTERM, lambda *_: stop.update(flag=True))
 
+    last_written: Dict[str, int] = {}
     while not stop["flag"]:
         try:
-            totals = collect_totals(sess)
-            if totals:
-                write_totals(sess, totals)
-            else:
-                log.debug("Noch keine Daten in den Quell-Buckets.")
+            run_once(sess, last_written)
         except Exception as e:  # pragma: no cover
             log.exception("Aggregator-Fehler: %s", e)
 

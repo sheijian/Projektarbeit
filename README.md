@@ -97,7 +97,7 @@ Alle InfluxDB-Zugriffe stehen in einer einzigen Datei:
 |-----------------------------------|---------------------------------------------------------------|
 | `query_username(user_id)`         | Anzeigename aus Bucket **PPMaster** (last)                    |
 | `query_points(user_id)`           | Guthaben aus Bucket **SpieloAutomat** (last, siehe unten)     |
-| `write_endscore(user_id, score)`  | Nach jedem Spieldurchlauf: neuen Kontostand in **SpieloAutomat** |
+| `write_score(user_id, score, delta=…)` | Nach jeder Hand: neuen Kontostand + Gewinn/Verlust in **SpieloAutomat** |
 
 Die Punkte-Abfrage sieht so aus:
 
@@ -112,11 +112,16 @@ from(bucket: "SpieloAutomat")
 
 Den Bucket `SpieloAutomat` füllt zweierlei:
 
-* der Aggregator (unten) – Summe aus allen sechs Spielstationen,
-* und Blackjack selbst – nach jeder Session wird der aktuelle
-  Kontostand als neuer `endscore,user_id=<uid> score=<neu>` geschrieben.
-  Beim nächsten Chip-Scan sieht `|> last()` sofort den aktualisierten
-  Wert.
+* der Aggregator (unten) – Summe aus allen sechs Spielstationen
+  **plus** allen Blackjack-Gewinnen/-Verlusten,
+* und Blackjack selbst – nach jeder Hand gehen zwei Datenpunkte raus:
+  `endscore,user_id=<uid> score=<neu>` (der neue Kontostand, damit
+  `|> last()` ihn sofort sieht) und `blackjack,user_id=<uid> delta=<±n>`
+  (Gewinn/Verlust der Hand).
+
+Das Delta ist wichtig: Der Aggregator rechnet den Gesamtstand immer neu
+aus. Ohne die Blackjack-Deltas käme er nur auf die Stationssumme und
+würde den Blackjack-Stand nach wenigen Sekunden wieder überschreiben.
 
 ## Score-Aggregator (Hintergrund-Dienst)
 
@@ -133,9 +138,15 @@ einem eigenen Bucket mit unterschiedlichem Schema:
 | Gedaechtnistest     | endscore              | endscore       | user_id   |
 
 Das Skript `scripts/score_aggregator.py` läuft dauerhaft auf dem Pi,
-pollt alle 5 Sekunden diese Buckets, summiert pro `user_id` und
-schreibt den Gesamtscore in `SpieloAutomat`
-(measurement `endscore`, field `score`, tag `user_id`).
+pollt alle 5 Sekunden diese Buckets und die Blackjack-Deltas
+(`SpieloAutomat`, measurement `blackjack`, field `delta`), summiert pro
+`user_id` und schreibt den Gesamtscore in `SpieloAutomat`
+(measurement `endscore`, field `score`, tag `user_id`) – allerdings nur
+für User, deren Summe sich seit dem letzten Write geändert hat.
+
+Nach einem Update des Codes den Dienst neu starten
+(`sudo systemctl restart blackjack-aggregator`), sonst läuft noch die
+alte Version und überschreibt weiter die Blackjack-Stände.
 
 ### Manuell starten (zum Testen)
 
