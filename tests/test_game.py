@@ -195,3 +195,24 @@ def test_round_end_callback_not_called_mid_round():
     game.start_round()
     assert seen == []           # Deal löst nicht aus
     # Erst nach game.stand() würde die Runde enden.
+
+
+def test_can_logout_only_between_rounds():
+    game = Game()
+    game.deck = StackedDeck([C("K"), C("6"), C("9"), C("10"), C("Q")])
+    assert not game.can_logout                  # niemand angemeldet
+    game.login(Player("uid", "T", 100), default_bet=25)
+    assert game.can_logout                      # BETTING
+    game.start_round()
+    assert not game.can_logout                  # mitten in der Hand
+    game.stand()
+    assert game.can_logout                      # ROUND_OVER
+    game.logout()
+    assert not game.can_logout
+
+
+def test_can_logout_with_too_low_balance():
+    """Auch wer zu wenig Guthaben zum Spielen hat, kann sich abmelden."""
+    game = Game(min_bet=10)
+    game.login(Player("uid", "T", 1), default_bet=10)
+    assert game.can_logout

@@ -3,8 +3,9 @@
 Blackjack-Automat mit:
 
 - Grafischer Oberfläche in **pygame** (gezeichnete Spielkarten, Vollbild-tauglich)
-- Vier **Arcade-Tastern** (Hit / Stand / Double / Split) über einen USB-Encoder
-  (EG STARTS Zero Delay) sowie Tastatur-Fallback `H` / `S` / `D` / `P`
+- Fünf **Arcade-Tastern** (Hit / Stand / Double / Split / Logout) über einen
+  USB-Encoder (EG STARTS Zero Delay) sowie Tastatur-Fallback
+  `H` / `S` / `D` / `P` / `L`
 - **RFID-Reader hinter einem ESP32** als HTTP-Statusseite
   (Default: `http://10.0.244.81/status`)
 - **InfluxDB-Bucket** (`SpieloAutomat`) – beim Chip-Auflegen wird der
@@ -105,7 +106,7 @@ die sich gegenseitig nie überschreiben:
 | Measurement / Field  | Bedeutung                             | Wer schreibt?                   |
 |----------------------|---------------------------------------|---------------------------------|
 | `endscore` / `score` | **Startguthaben** = Summe der sechs Stationen | nur der Aggregator (alle 5 s) |
-| `blackjack` / `endwert` | **Endwert** nach der letzten Blackjack-Hand | nur Blackjack (nach jeder Hand) |
+| `blackjack` / `endwert` | **Endwert** nach der letzten Blackjack-Hand | nur Blackjack (nach jeder Hand + beim Logout) |
 
 Beim Chip-Auflegen gilt: **Endwert, falls vorhanden – sonst
 Startguthaben.** Wer schon Blackjack gespielt hat, landet also immer bei
@@ -121,6 +122,35 @@ from(bucket: "SpieloAutomat")
        (r._measurement == "endscore" and r._field == "score"))
   |> last()
 ```
+
+Beim Schreiben schicken Blackjack und Aggregator **keinen Zeitstempel**
+mit – InfluxDB setzt die Serverzeit. Die Uhr des Pi geht ohne
+Internet/NTP falsch; Datenpunkte mit Pi-Zeit landeten z. B. am 19.09.
+und waren im Data Explorer mit „Past 1h“ unsichtbar.
+
+Endwerte prüfen (Data Explorer → Script Editor):
+
+```flux
+from(bucket: "SpieloAutomat")
+  |> range(start: 0)
+  |> filter(fn: (r) => r._measurement == "blackjack" and r._field == "endwert")
+  |> last()
+```
+
+### Logout-Taster (K5 / Taste `L`)
+
+Zwischen zwei Runden meldet der Logout-Taster den Spieler ab:
+
+1. Kontostand als Endwert nach `SpieloAutomat` (`blackjack` / `endwert`)
+   schreiben,
+2. RFID-User am ESP32 abmelden: `GET http://10.0.244.81/logout`
+   (abgeleitet aus `--rfid-url`, überschreibbar mit `--logout-url`),
+3. Spieler im Spiel abmelden – „Tschüss …! Endwert: …“.
+
+Schlägt Schritt 1 oder 2 fehl, bleibt der Spieler angemeldet und kann
+nochmal drücken. Mitten in einer Hand ist Logout gesperrt. Zusätzlich
+wird der Endwert nach jeder Hand gespeichert – falls jemand geht, ohne
+Logout zu drücken.
 
 ## Score-Aggregator (Hintergrund-Dienst)
 
@@ -167,10 +197,11 @@ Programm selbst – ganz oben in `blackjack/influx_db.py` ein.
 
 ## Steuerung
 
-Das Arcade-Board (EG-STARTS-USB-Encoder) hat vier Buchsen K1..K4. Die
+Das Arcade-Board (EG-STARTS-USB-Encoder) nutzt die Buchsen K1..K5. Die
 Zuordnung Buchse → Aktion liegt in `blackjack/config.py` unter
-`K_ACTIONS` (Default: K1=Hit, K2=Stand, K3=Double, K4=Split). Die
-Button-Nummern des Encoders findest du mit:
+`K_ACTIONS` (Default: K1=Hit, K2=Stand, K3=Double, K4=Split,
+K5=Logout). Die Button-Nummern des Encoders (Default K5 = Button 4)
+findest du mit:
 
 ```bash
 python -m scripts.find_buttons
@@ -182,6 +213,7 @@ python -m scripts.find_buttons
 | Stand / Deal      | K2        | `S`      |
 | Double            | K3        | `D`      |
 | Split             | K4        | `P`      |
+| Logout            | K5        | `L`      |
 | Vollbild an/aus   | –         | `F11`    |
 | Spiel beenden     | –         | `Esc`    |
 

@@ -213,9 +213,8 @@ def test_write_endwert_sends_line_protocol():
     }
     assert call["headers"]["Authorization"] == "Token tw"
     lines = call["body"].strip().splitlines()
-    assert len(lines) == 1
-    assert lines[0].startswith("blackjack,user_id=abc-uid endwert=40i ")
-    assert "username" not in lines[0]
+    # Ohne Zeitstempel - InfluxDB setzt die Serverzeit (Pi-Uhr geht falsch).
+    assert lines == ["blackjack,user_id=abc-uid endwert=40i"]
 
 
 def test_write_endwert_never_touches_aggregator_measurement():
@@ -231,9 +230,7 @@ def test_write_endwert_adds_username_field():
     with _test_env(sess):
         assert influx_db.write_endwert(UID, 125, username="Tobias")
     line = sess.calls[0]["body"].strip()
-    assert line.startswith(
-        f'blackjack,user_id={UID} endwert=125i,username="Tobias" '
-    )
+    assert line == f'blackjack,user_id={UID} endwert=125i,username="Tobias"'
 
 
 def test_write_endwert_escapes_quotes_in_username():

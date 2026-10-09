@@ -103,10 +103,11 @@ def write_totals(
     """Schreibt pro user_id das Startguthaben nach SpieloAutomat."""
     if not totals:
         return True
-    ts_ms = int(time.time() * 1000)
+    # Ohne Zeitstempel: InfluxDB setzt die Serverzeit (die Pi-Uhr geht
+    # ohne NTP falsch - siehe SERVER_TIME_NOTE in blackjack/influx_db.py).
     lines = [
         f"{SCORE_MEASUREMENT},{SCORE_TAG}={_esc_tag(uid)} "
-        f"{SCORE_FIELD}={int(score)}i {ts_ms}"
+        f"{SCORE_FIELD}={int(score)}i"
         for uid, score in totals.items()
     ]
     body = "\n".join(lines) + "\n"

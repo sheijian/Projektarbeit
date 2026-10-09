@@ -10,6 +10,8 @@ Antwort hat das Format:
 Nur wenn ``status == "logged_in"`` wird die ``user_id`` zurückgegeben
 und ein Login im Spiel ausgelöst. Jeder andere Status (``idle``,
 ``logged_out``, ...) bedeutet "kein Chip aufgelegt".
+
+Abmelden: ``GET http://10.0.244.81/logout`` (siehe ``HTTPRFIDReader.logout``).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import re
 import threading
 import time
 from typing import Dict, Optional
+from urllib.parse import urljoin
 
 import requests
 
@@ -92,14 +95,26 @@ class HTTPRFIDReader:
     POLL_INTERVAL = 0.5     # Sekunden zwischen Abfragen
     IDLE_TIMEOUT = 3.0      # Sekunden ohne Login → "abgemeldet"
 
-    def __init__(self, url: str, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        timeout: float = 2.0,
+        logout_url: Optional[str] = None,
+        autostart: bool = True,
+    ) -> None:
         self.url = url
+        # .../status -> .../logout
+        self.logout_url = logout_url or urljoin(url, "logout")
         self.timeout = timeout
 
         self.events: "queue.Queue[Optional[str]]" = queue.Queue()
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._last_uid: Optional[str] = None
         self._last_seen: float = 0.0
+        # Nach unserem Logout meldet der ESP32 evtl. noch kurz den alten
+        # User - diese UID ignorieren, bis einmal "nicht eingeloggt" kam.
+        self._ignore_uid: Optional[str] = None
         # Von UID auf zuletzt gesehenen Anzeigenamen (für "Spieler:" im HUD).
         self._names: Dict[str, str] = {}
 
@@ -107,8 +122,9 @@ class HTTPRFIDReader:
         self._thread = threading.Thread(
             target=self._loop, name="rfid-http", daemon=True,
         )
-        self._thread.start()
-        log.info("HTTPRFIDReader aktiv (%s)", url)
+        if autostart:
+            self._thread.start()
+        log.info("HTTPRFIDReader aktiv (%s, Logout: %s)", url, self.logout_url)
 
     # ------------------------------------------------------------------
     def _loop(self) -> None:
@@ -139,18 +155,22 @@ class HTTPRFIDReader:
         return uid
 
     def _process_uid(self, uid: Optional[str]) -> None:
-        now = time.monotonic()
-        if uid is None:
-            if self._last_uid is not None and now - self._last_seen > self.IDLE_TIMEOUT:
-                log.info("HTTP-RFID: Login %s abgemeldet", self._last_uid)
-                self._last_uid = None
-                self.events.put(None)
-            return
-        self._last_seen = now
-        if uid != self._last_uid:
-            log.info("HTTP-RFID: neue ID %s", uid)
-            self._last_uid = uid
-            self.events.put(uid)
+        with self._lock:
+            now = time.monotonic()
+            if uid is None:
+                self._ignore_uid = None
+                if self._last_uid is not None and now - self._last_seen > self.IDLE_TIMEOUT:
+                    log.info("HTTP-RFID: Login %s abgemeldet", self._last_uid)
+                    self._last_uid = None
+                    self.events.put(None)
+                return
+            if uid == self._ignore_uid:
+                return
+            self._last_seen = now
+            if uid != self._last_uid:
+                log.info("HTTP-RFID: neue ID %s", uid)
+                self._last_uid = uid
+                self.events.put(uid)
 
     # ------------------------------------------------------------------
     # Öffentliche API
@@ -158,6 +178,29 @@ class HTTPRFIDReader:
     def get_name_hint(self, uid: str) -> Optional[str]:
         """Zuletzt gesehener Anzeigename zu dieser UID (falls bekannt)."""
         return self._names.get(uid)
+
+    def logout(self) -> bool:
+        """Meldet den aktuellen RFID-User am ESP32 ab (``GET <logout_url>``).
+
+        Liefert ``True``, wenn der ESP32 den Logout bestätigt hat. Danach
+        löst derselbe Chip beim nächsten Auflegen wieder einen Login aus.
+        """
+        try:
+            # Eigener Request statt self._session - die nutzt der Poll-Thread.
+            r = requests.get(self.logout_url, timeout=self.timeout)
+            if r.status_code == 405:    # Endpunkt nimmt nur POST an
+                r = requests.post(self.logout_url, timeout=self.timeout)
+        except requests.RequestException as e:
+            log.warning("RFID-Logout %s: Netzwerkfehler %s", self.logout_url, e)
+            return False
+        if not r.ok:
+            log.warning("RFID-Logout %s: HTTP %s", self.logout_url, r.status_code)
+            return False
+        with self._lock:
+            self._ignore_uid = self._last_uid
+            self._last_uid = None
+        log.info("RFID-Logout OK (%s)", self.logout_url)
+        return True
 
     def handle_pygame_event(self, event) -> None:
         # Kein Keyboard-Mock mehr - die echte HTTP-Quelle läuft.

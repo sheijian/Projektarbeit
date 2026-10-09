@@ -377,6 +377,8 @@ class BlackjackGUI:
                                  and current_hand is not None
                                  and current_hand.can_split),
             ]
+        # Logout (K5) - nur zwischen den Runden aktiv.
+        actions.append(("LOGOUT", "L", game.can_logout))
 
         btn_w = 180
         spacing = 20

@@ -122,6 +122,14 @@ class Game:
             self.state = State.BETTING
             self.message = f"Willkommen {player.name}! Einsatz: {self.current_bet}"
 
+    @property
+    def can_logout(self) -> bool:
+        """Logout nur zwischen den Runden - nicht mitten in einer Hand,
+        sonst wäre der Einsatz schon abgezogen."""
+        return self.player is not None and self.state in (
+            State.NO_PLAYER, State.BETTING, State.ROUND_OVER,
+        )
+
     def logout(self) -> None:
         self.player = None
         self.hands = []

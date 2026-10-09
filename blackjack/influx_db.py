@@ -16,7 +16,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import time
 from typing import Dict, Iterator, Optional
 
 import requests
@@ -67,6 +66,11 @@ SCORE_FIELD       = "score"       # int
 ENDWERT_MEASUREMENT = "blackjack"   # Blackjack-Endwert
 ENDWERT_FIELD       = "endwert"     # int
 ENDWERT_NAME_FIELD  = "username"    # str (zusätzlich im selben Datenpunkt)
+
+# SERVER_TIME_NOTE: Wir schicken beim Schreiben KEINEN Zeitstempel mit -
+# InfluxDB setzt dann seine eigene Serverzeit. Die Uhr des Raspberry Pi
+# geht ohne Internet/NTP falsch (Datenpunkte landeten z. B. am 19.09.
+# statt heute) und tauchen dann im Data Explorer ("Past 1h") nicht auf.
 # ===========================================================================
 
 
@@ -180,9 +184,10 @@ def write_endwert(
     fields = [f"{ENDWERT_FIELD}={int(endwert)}i"]
     if username:
         fields.append(f'{ENDWERT_NAME_FIELD}="{_esc_str(username)}"')
+    # Ohne Zeitstempel - siehe SERVER_TIME_NOTE.
     line = (
         f"{ENDWERT_MEASUREMENT},{SCORE_TAG}={_esc_tag(user_id)} "
-        f"{','.join(fields)} {int(time.time() * 1000)}\n"
+        f"{','.join(fields)}\n"
     )
     log.debug("write_endwert -> %s/api/v2/write LINE: %s",
               INFLUX_URL, line.strip())

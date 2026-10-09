@@ -1,16 +1,16 @@
 """Hilfsskript zum Herausfinden der USB-Button-Nummern.
 
 Der EG-STARTS-Encoder (und die meisten Zero-Delay-Boards) meldet sich per
-USB als HID-Gamepad. Jede der K1..K4-Buchsen entspricht einer bestimmten
+USB als HID-Gamepad. Jede der K1..K5-Buchsen entspricht einer bestimmten
 Button-Nummer, die je nach Firmware unterschiedlich sein kann.
 
 Aufruf:
 
     python -m scripts.find_buttons
 
-Ein kleines pygame-Fenster öffnet sich. Drücke der Reihe nach K1, K2, K3
-und K4 - im Terminal erscheint jeweils die zugehörige Button-Nummer. Trage
-diese vier Zahlen in `blackjack/config.py` unter ``K_JOY_BUTTONS`` ein.
+Ein kleines pygame-Fenster öffnet sich. Drücke der Reihe nach K1 bis K5
+(K5 = Logout) - im Terminal erscheint jeweils die zugehörige Button-Nummer.
+Trage diese Zahlen in `blackjack/config.py` unter ``K_JOY_BUTTONS`` ein.
 
 Mit Strg+C oder über das Fensterkreuz beenden.
 """
@@ -44,11 +44,11 @@ def main() -> int:
 
     # Ein Fenster ist nötig, damit pygame Events zustellt.
     screen = pygame.display.set_mode((360, 120))
-    pygame.display.set_caption("find_buttons - K1..K4 drücken")
+    pygame.display.set_caption("find_buttons - K1..K5 drücken")
     font = pygame.font.SysFont("dejavusans", 18, bold=True)
 
     last: str = "Warte auf Tastendruck …"
-    print("\nDrücke der Reihe nach K1, K2, K3, K4. Beenden mit Strg+C.")
+    print("\nDrücke der Reihe nach K1 bis K5. Beenden mit Strg+C.")
 
     try:
         running = True

@@ -17,6 +17,9 @@ Beispiele:
 
     # Live-Reader-Test mit beliebigem Startguthaben
     python main.py --starting-balance 500
+
+Logout-Taster (K5 bzw. Taste L): speichert den Endwert in SpieloAutomat
+(blackjack/endwert) und meldet den RFID-User am ESP32 ab (.../logout).
 """
 
 from __future__ import annotations
@@ -46,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--rfid-url", metavar="URL", default=DEFAULT_RFID_URL,
         help=f"HTTP-URL des RFID-Readers (Default: {DEFAULT_RFID_URL}).",
+    )
+    p.add_argument(
+        "--logout-url", metavar="URL", default=None,
+        help="Logout-Endpunkt des ESP32 (Default: aus --rfid-url abgeleitet, "
+             "also .../logout).",
     )
     p.add_argument(
         "--offline", action="store_true",
@@ -97,10 +105,14 @@ class App:
         # Zeige klar an, ob die InfluxDB-Verbindung bereit ist.
         if influx_db.INFLUX_TOKEN_READ:
             log.info(
-                "InfluxDB: %s (org=%s) - Score-Query aus '%s', "
-                "Username-Query aus '%s'",
+                "InfluxDB: %s (org=%s) - Startguthaben aus %s/%s/%s, "
+                "Endwert nach %s/%s/%s, Username aus %s",
                 influx_db.INFLUX_URL, influx_db.INFLUX_ORG,
-                influx_db.SCORE_BUCKET, influx_db.USERNAME_BUCKET,
+                influx_db.SCORE_BUCKET, influx_db.SCORE_MEASUREMENT,
+                influx_db.SCORE_FIELD,
+                influx_db.SCORE_BUCKET, influx_db.ENDWERT_MEASUREMENT,
+                influx_db.ENDWERT_FIELD,
+                influx_db.USERNAME_BUCKET,
             )
         else:
             log.warning(
@@ -122,7 +134,7 @@ class App:
             self.rfid: Optional[HTTPRFIDReader] = None
             self._auto_login_pending = args.auto_login
         else:
-            self.rfid = HTTPRFIDReader(args.rfid_url)
+            self.rfid = HTTPRFIDReader(args.rfid_url, logout_url=args.logout_url)
 
     # ------------------------------------------------------------------
     def run(self) -> int:
@@ -213,16 +225,50 @@ class App:
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
-        """Nach jeder Hand den Kontostand als Blackjack-Endwert nach
-        SpieloAutomat schreiben. Der Aggregator überschreibt ihn nicht -
-        beim nächsten Login landet der Spieler genau hier."""
+        """Nach jeder Hand den Endwert zwischenspeichern - falls jemand
+        geht, ohne den Logout-Taster zu drücken."""
+        self._save_endwert(player)
+
+    def _save_endwert(self, player: Player) -> bool:
+        """Schreibt den Kontostand als Blackjack-Endwert nach SpieloAutomat.
+
+        Ohne Schreib-Token (Offline-Test) gibt es nichts zu speichern -
+        dann ``True``, damit der Logout trotzdem funktioniert.
+        """
+        if not influx_db.INFLUX_TOKEN_WRITE:
+            log.warning("Endwert %d nicht gespeichert: INFLUX_TOKEN_WRITE "
+                        "fehlt in blackjack/influx_db.py", player.balance)
+            return True
         # Username nur mitgeben, wenn er ein echter Name ist - der
         # Fallback-Name == UUID soll NICHT ins username-Field.
         name = player.name if player.name and player.name != player.rfid else None
         try:
-            influx_db.write_endwert(player.rfid, player.balance, username=name)
+            return influx_db.write_endwert(player.rfid, player.balance, username=name)
         except Exception as e:
-            log.warning("write_endwert nach Runde fehlgeschlagen: %s", e)
+            log.warning("write_endwert fehlgeschlagen: %s", e)
+            return False
+
+    def _logout(self) -> None:
+        """Logout-Taster: Endwert speichern, dann RFID-User am ESP32
+        abmelden. Schlägt ein Schritt fehl, bleibt der Spieler angemeldet
+        und kann es nochmal versuchen."""
+        player = self.game.player
+        if player is None:
+            self.game.message = "Kein Spieler angemeldet"
+            return
+        if not self.game.can_logout:
+            self.game.message = "Erst die Runde zu Ende spielen"
+            return
+        if not self._save_endwert(player):
+            self.game.message = "Speichern fehlgeschlagen - nochmal Logout"
+            return
+        if self.rfid is not None and not self.rfid.logout():
+            self.game.message = "RFID-Logout fehlgeschlagen - nochmal Logout"
+            return
+        log.info("Logout: user_id=%s | name=%s | Endwert=%d gespeichert",
+                 player.rfid, player.name, player.balance)
+        self.game.logout()
+        self.game.message = f"Tschüss {player.name}! Endwert: {player.balance}"
 
     # ------------------------------------------------------------------
     # Taster
@@ -235,6 +281,9 @@ class App:
             self._dispatch(action)
 
     def _dispatch(self, action: str) -> None:
+        if action == "logout":
+            self._logout()
+            return
         if self.game.player is None:
             self.game.message = "Bitte zuerst RFID-Chip auflegen"
             return

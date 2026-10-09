@@ -10,6 +10,7 @@ from typing import Dict
 # Der RFID-Reader meldet sich über HTTP; standardmäßig unter dieser URL.
 # Kann über `--rfid-url` auf der Kommandozeile überschrieben werden.
 DEFAULT_RFID_URL = "http://10.0.244.81/status"
+# Der Logout-Endpunkt wird daraus abgeleitet: .../status -> .../logout.
 
 
 # ---------------------------------------------------------------------------
@@ -20,6 +21,7 @@ K_ACTIONS: Dict[str, str] = {
     "K2": "stand",
     "K3": "double",
     "K4": "split",
+    "K5": "logout",     # Endwert speichern + RFID-User abmelden
 }
 
 
@@ -34,6 +36,7 @@ K_JOY_BUTTONS: Dict[str, int] = {
     "K2": 1,
     "K3": 2,
     "K4": 3,
+    "K5": 4,
 }
 
 
@@ -41,7 +44,7 @@ def build_button_joy(
     k_buttons: Dict[str, int] = K_JOY_BUTTONS,
     k_actions: Dict[str, str] = K_ACTIONS,
 ) -> Dict[str, int]:
-    """Aktion -> USB-Button-Index aus der K1..K4-Belegung."""
+    """Aktion -> USB-Button-Index aus der K1..K5-Belegung."""
     return {action: k_buttons[k] for k, action in k_actions.items()}
 
 
@@ -60,6 +63,7 @@ KEYBOARD_FALLBACK: Dict[str, str] = {
     "stand":  "s",
     "double": "d",
     "split":  "p",
+    "logout": "l",
 }
 
 

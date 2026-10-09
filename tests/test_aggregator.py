@@ -129,7 +129,8 @@ def test_write_totals_sends_line_protocol():
     w = sess.writes[0]
     assert w["bucket"] == "SpieloAutomat"
     assert len(w["lines"]) == 1
-    assert w["lines"][0].startswith("endscore,user_id=alice score=150i ")
+    # Ohne Zeitstempel - InfluxDB setzt die Serverzeit.
+    assert w["lines"][0] == "endscore,user_id=alice score=150i"
 
 
 def test_write_totals_empty_is_noop():
