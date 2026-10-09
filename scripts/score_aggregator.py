@@ -1,9 +1,11 @@
 """Score-Aggregator - läuft dauerhaft auf dem Raspberry Pi.
 
-Pollt alle 5 Sekunden die sechs Spielstationen-Buckets plus die
-Blackjack-Gewinne/-Verluste, summiert pro ``user_id`` und schreibt den
-Gesamtscore in den gemeinsamen Bucket ``SpieloAutomat`` - aber nur für
-User, deren Summe sich seit dem letzten Write geändert hat.
+Pollt alle 5 Sekunden die sechs Spielstationen-Buckets, summiert pro
+``user_id`` und schreibt die Summe als Startguthaben nach
+``SpieloAutomat`` (endscore/score) - aber nur für User, deren Summe sich
+seit dem letzten Write geändert hat.
+
+Den Blackjack-Endwert (blackjack/endwert) fasst der Aggregator nie an.
 
 Aufruf:
     python -m scripts.score_aggregator            # Dauerlauf
@@ -26,8 +28,6 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from blackjack.influx_db import (
-    DELTA_FIELD,
-    DELTA_MEASUREMENT,
     INFLUX_ORG,
     INFLUX_TOKEN_READ,
     INFLUX_TOKEN_WRITE,
@@ -55,20 +55,12 @@ SOURCE_BUCKETS: List[Tuple[str, str, str, str]] = [
     ("Gedaechtnistest",  "endscore",            "endscore",      "user_id"),
 ]
 
-# Gewinn/Verlust jeder Blackjack-Hand (von main.py geschrieben). Ohne diese
-# Quelle würde der Aggregator den Blackjack-Stand mit der reinen
-# Stationssumme überschreiben.
-BLACKJACK_SOURCE: Tuple[str, str, str, str] = (
-    SCORE_BUCKET, DELTA_MEASUREMENT, DELTA_FIELD, SCORE_TAG,
-)
-
 
 # ---------------------------------------------------------------------------
 def collect_totals(session: requests.Session) -> Dict[str, int]:
-    """Fragt alle sechs Buckets + die Blackjack-Deltas ab und addiert pro
-    user_id."""
+    """Fragt alle sechs Buckets ab und addiert pro user_id."""
     totals: Dict[str, int] = defaultdict(int)
-    for bucket, meas, field, tag in (*SOURCE_BUCKETS, BLACKJACK_SOURCE):
+    for bucket, meas, field, tag in SOURCE_BUCKETS:
         flux = (
             f'from(bucket: "{bucket}")\n'
             f'  |> range(start: 0)\n'
@@ -108,7 +100,7 @@ def write_totals(
     session: requests.Session,
     totals: Dict[str, int],
 ) -> bool:
-    """Schreibt pro user_id einen Datenpunkt in SpieloAutomat."""
+    """Schreibt pro user_id das Startguthaben nach SpieloAutomat."""
     if not totals:
         return True
     ts_ms = int(time.time() * 1000)
@@ -146,8 +138,8 @@ def run_once(
 ) -> Optional[Dict[str, int]]:
     """Ein Durchlauf: Summen holen und nur geänderte User schreiben.
 
-    ``last_written`` merkt sich pro user_id den zuletzt geschriebenen
-    Gesamtstand und wird nach erfolgreichem Write aktualisiert. Liefert
+    ``last_written`` merkt sich pro user_id das zuletzt geschriebene
+    Startguthaben und wird nach erfolgreichem Write aktualisiert. Liefert
     die geschriebenen Summen (``None`` bei Write-Fehler).
     """
     totals = collect_totals(session)

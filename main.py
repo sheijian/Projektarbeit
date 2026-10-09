@@ -82,9 +82,9 @@ class App:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
 
-        # Guthaben wird aktuell lokal verwaltet. Unbekannte UIDs werden
-        # mit --starting-balance direkt angelegt - die DB-Punkte-Abfrage
-        # steht noch aus (siehe blackjack/influx_db.query_points).
+        # Lokaler Zwischenspeicher fürs Guthaben. Beim Login wird er mit
+        # influx_db.query_balance befüllt; liefert die DB nichts, bekommt
+        # die UID --starting-balance.
         self.store = LocalPlayerStore(
             auto_register=True,
             auto_balance=args.starting_balance,
@@ -116,10 +116,6 @@ class App:
         )
         self.gui = BlackjackGUI(self.game)
         self.buttons = ButtonHandler(mode=args.input)
-
-        # Kontostand, der zuletzt erfolgreich in SpieloAutomat stand. Die
-        # Differenz dazu geht nach jeder Hand als Blackjack-Delta in die DB.
-        self._saved_balance: Optional[int] = None
 
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
@@ -167,7 +163,7 @@ class App:
                 return
             if uid is None:
                 log.info("RFID abgemeldet")
-                # Der aktuelle Score steht bereits in SpieloAutomat
+                # Der Endwert steht bereits in SpieloAutomat
                 # (nach jeder Runde über _on_round_end geschrieben).
                 self.game.logout()
             else:
@@ -176,12 +172,13 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
 
-        # 1) Punktestand aus SpieloAutomat.
-        score = influx_db.query_score(uid)
+        # 1) Kontostand aus SpieloAutomat: Blackjack-Endwert, falls der
+        #    Spieler schon gespielt hat - sonst Startguthaben (Aggregator).
+        score = influx_db.query_balance(uid)
         if score is None:
             log.warning(
-                "SpieloAutomat hat noch keinen Score für user_id=%s - "
-                "nehme Fallback %d",
+                "SpieloAutomat hat weder Endwert noch Startguthaben für "
+                "user_id=%s - nehme Fallback %d",
                 uid, self.args.starting_balance,
             )
         else:
@@ -201,7 +198,6 @@ class App:
             "Login: user_id=%s | name=%s | balance=%d",
             player.rfid, player.name, player.balance,
         )
-        self._saved_balance = player.balance
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _auto_login(self, name: str) -> None:
@@ -214,33 +210,19 @@ class App:
             log.warning("Auto-Login: Spieler '%s' unbekannt", name)
             return
         log.info("Auto-Login: %s (Guthaben %d)", player.name, player.balance)
-        self._saved_balance = player.balance
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
-        """Nach jeder Hand den aktuellen Guthabenstand plus den Gewinn/
-        Verlust seit dem letzten Write nach SpieloAutomat schreiben.
-
-        Das Delta braucht der Aggregator: Er rechnet den Gesamtstand
-        immer neu aus (Stationen + Blackjack-Deltas). Ohne Delta würde er
-        den Blackjack-Stand nach wenigen Sekunden wieder überschreiben.
-        """
+        """Nach jeder Hand den Kontostand als Blackjack-Endwert nach
+        SpieloAutomat schreiben. Der Aggregator überschreibt ihn nicht -
+        beim nächsten Login landet der Spieler genau hier."""
         # Username nur mitgeben, wenn er ein echter Name ist - der
         # Fallback-Name == UUID soll NICHT ins username-Field.
         name = player.name if player.name and player.name != player.rfid else None
-        saved = player.balance if self._saved_balance is None else self._saved_balance
-        delta = player.balance - saved
         try:
-            ok = influx_db.write_score(
-                player.rfid, player.balance, username=name, delta=delta,
-            )
+            influx_db.write_endwert(player.rfid, player.balance, username=name)
         except Exception as e:
-            log.warning("write_score nach Runde fehlgeschlagen: %s", e)
-            ok = False
-        # Nur bei Erfolg weiterschieben - sonst geht das Delta beim
-        # nächsten Write mit.
-        if ok:
-            self._saved_balance = player.balance
+            log.warning("write_endwert nach Runde fehlgeschlagen: %s", e)
 
     # ------------------------------------------------------------------
     # Taster
@@ -271,7 +253,7 @@ class App:
 
     # ------------------------------------------------------------------
     def _shutdown(self) -> None:
-        # Der letzte Scorestand steht bereits nach der letzten Runde in
+        # Der Endwert steht bereits nach der letzten Runde in
         # SpieloAutomat - hier ist nichts weiter zu persistieren.
         try:
             self.buttons.close()
