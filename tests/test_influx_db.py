@@ -259,7 +259,10 @@ def test_query_username_parses_last_value():
     assert 'from(bucket: "PPMaster")' in body
     assert 'r._measurement == "PPMaster"' in body
     assert 'r._field == "username"' in body
-    assert f'r.user_id == "{UID}"' in body
+    # ESP32 schreibt jetzt "userid", ältere Punkte haben noch "user_id".
+    assert f'(exists r.userid and r.userid == "{UID}")' in body
+    assert f'(exists r.user_id and r.user_id == "{UID}")' in body
+    assert '|> sort(columns: ["_time"])' in body
 
 
 def test_query_username_returns_none_on_empty_or_error():

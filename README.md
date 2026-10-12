@@ -82,11 +82,11 @@ python main.py --starting-balance 1000
 Der ESP32-Reader meldet unter seiner Statusseite:
 
 ```json
-{"status":"logged_in","user_id":"d83751ae-...","username":"Jonathan","run_id":"0","time":4}
+{"status":"logged_in","userid":"d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb","username":"Jonathan","runid":"5","time":178}
 ```
 
 Nur wenn `status == "logged_in"` wird der Spieler eingeloggt. Die
-`user_id` wird dann an `blackjack/influx_db.query_username(uid)` gegeben,
+`userid` wird dann an `blackjack/influx_db.query_username(uid)` gegeben,
 das die DB nach dem **tatsächlichen Anzeigenamen** fragt (das Field
 `username` aus dem Measurement `PPMaster`). Dieser Name steht
 anschließend im HUD als "Spieler: Jonathan". Als Fallback wird der

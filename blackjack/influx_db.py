@@ -72,7 +72,9 @@ SCORE_BUCKET = "SpieloAutomat"
 USERNAME_BUCKET      = "PPMaster"
 USERNAME_MEASUREMENT = "PPMaster"
 USERNAME_FIELD       = "username"
-USERNAME_TAG         = "user_id"
+# Tag der RFID-ID - der ESP32 hat von "user_id" auf "userid" umgestellt,
+# die Abfrage akzeptiert beide (ältere Datenpunkte haben noch user_id).
+USERNAME_TAGS        = ("userid", "user_id")
 
 # Beim Schreiben schicken wir KEINEN Zeitstempel mit - InfluxDB setzt dann
 # seine Serverzeit. Die Uhr des Raspberry Pi geht ohne Internet/NTP falsch
@@ -106,7 +108,7 @@ def _is_configured() -> bool:
 # ---------------------------------------------------------------------------
 # Lesen
 # ---------------------------------------------------------------------------
-def query_balance(user_id: str) -> Optional[int]:
+def query_balance(userid: str) -> Optional[int]:
     """Kontostand für den Login.
 
     Hat der Spieler schon Blackjack gespielt, ist das sein Endwert aus
@@ -120,35 +122,35 @@ def query_balance(user_id: str) -> Optional[int]:
     if not _is_configured():
         log.warning("query_balance: InfluxDB nicht konfiguriert")
         return None
-    endwert = query_endwert(user_id)
+    endwert = query_endwert(userid)
     if endwert is not None:
         log.info("query_balance: userid=%s -> %d (Blackjack-Endwert)",
-                 user_id, endwert)
+                 userid, endwert)
         return endwert
-    points = query_station_points(user_id)
+    points = query_station_points(userid)
     if not points:
-        log.info("query_balance: keine Punkte für userid=%s", user_id)
+        log.info("query_balance: keine Punkte für userid=%s", userid)
         return None
     total = sum(points.values())
     log.info("query_balance: userid=%s -> %d (Startguthaben aus %s)",
-             user_id, total, points)
+             userid, total, points)
     return total
 
 
-def query_endwert(user_id: str) -> Optional[int]:
+def query_endwert(userid: str) -> Optional[int]:
     """Letzter Blackjack-Endwert aus SpieloAutomat. Wirft ``DBError``."""
     flux = (
         f'from(bucket: "{SCORE_BUCKET}")\n'
         f'  |> range(start: 0)\n'
         f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
         f'r._field == "{FIELD}")\n'
-        f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(user_id)}")\n'
+        f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(userid)}")\n'
         f'  |> last()\n'
     )
     return _to_int(_first_value(_run_query(flux)))
 
 
-def query_station_points(user_id: str) -> Dict[str, int]:
+def query_station_points(userid: str) -> Dict[str, int]:
     """Punkte pro Station (Summe aller Durchläufe). Stationen ohne Daten
     fehlen im Ergebnis. Ein noch nicht angelegter Bucket zählt als 0,
     jeder andere Fehler wirft ``DBError``."""
@@ -159,7 +161,7 @@ def query_station_points(user_id: str) -> Dict[str, int]:
             f'  |> range(start: 0)\n'
             f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
             f'r._field == "{FIELD}")\n'
-            f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(user_id)}")\n'
+            f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(userid)}")\n'
             f'  |> group()\n'
             f'  |> sum()\n'
         )
@@ -175,8 +177,8 @@ def query_station_points(user_id: str) -> Dict[str, int]:
     return points
 
 
-def query_username(user_id: str) -> Optional[str]:
-    """Letzter ``username`` für ``user_id`` aus PPMaster."""
+def query_username(userid: str) -> Optional[str]:
+    """Letzter ``username`` für ``userid`` aus PPMaster."""
     if not _is_configured():
         return None
     flux = (
@@ -184,7 +186,10 @@ def query_username(user_id: str) -> Optional[str]:
         f'  |> range(start: 0)\n'
         f'  |> filter(fn: (r) => r._measurement == "{USERNAME_MEASUREMENT}")\n'
         f'  |> filter(fn: (r) => r._field == "{USERNAME_FIELD}")\n'
-        f'  |> filter(fn: (r) => r.{USERNAME_TAG} == "{_esc_q(user_id)}")\n'
+        f'  |> filter(fn: (r) => {_tag_match(USERNAME_TAGS, userid)})\n'
+        # Beide Tag-Varianten zusammenführen, dann den neuesten Namen nehmen.
+        f'  |> group()\n'
+        f'  |> sort(columns: ["_time"])\n'
         f'  |> last()\n'
     )
     try:
@@ -192,17 +197,17 @@ def query_username(user_id: str) -> Optional[str]:
     except DBError:
         return None
     if name is None:
-        log.info("query_username: kein Datenpunkt für user_id=%s in %s",
-                 user_id, USERNAME_BUCKET)
+        log.info("query_username: kein Datenpunkt für userid=%s in %s",
+                 userid, USERNAME_BUCKET)
         return None
-    log.info("query_username: user_id=%s -> %r", user_id, name)
+    log.info("query_username: userid=%s -> %r", userid, name)
     return name
 
 
 # ---------------------------------------------------------------------------
 # Schreiben
 # ---------------------------------------------------------------------------
-def write_endwert(user_id: str, endwert: int) -> bool:
+def write_endwert(userid: str, endwert: int) -> bool:
     """Schreibt den Blackjack-Endwert nach SpieloAutomat
     (``durchlauf,userid=<id> endscore=<wert>``)."""
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
@@ -210,7 +215,7 @@ def write_endwert(user_id: str, endwert: int) -> bool:
         return False
 
     # Ohne Zeitstempel - InfluxDB setzt die Serverzeit.
-    line = f"{MEASUREMENT},{TAG}={_esc_tag(user_id)} {FIELD}={int(endwert)}i\n"
+    line = f"{MEASUREMENT},{TAG}={_esc_tag(userid)} {FIELD}={int(endwert)}i\n"
     log.debug("write_endwert -> %s/api/v2/write LINE: %s",
               INFLUX_URL, line.strip())
 
@@ -233,7 +238,7 @@ def write_endwert(user_id: str, endwert: int) -> bool:
                     r.status_code, r.text[:200], line.strip())
         return False
     log.info("write_endwert OK: %s/%s userid=%s endscore=%d",
-             SCORE_BUCKET, MEASUREMENT, user_id, endwert)
+             SCORE_BUCKET, MEASUREMENT, userid, endwert)
     return True
 
 
@@ -296,6 +301,13 @@ def _to_int(value: Optional[str]) -> Optional[int]:
         return int(float(value))
     except ValueError:
         raise DBError(f"nicht-numerischer Wert {value!r}") from None
+
+
+def _tag_match(tags, value: str) -> str:
+    """Flux-Bedingung "einer der Tags hat diesen Wert" - ``exists``, weil
+    nicht jeder Datenpunkt jeden Tag hat."""
+    v = _esc_q(value)
+    return " or ".join(f'(exists r.{t} and r.{t} == "{v}")' for t in tags)
 
 
 def _esc_q(s: str) -> str:

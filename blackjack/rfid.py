@@ -4,10 +4,11 @@ Der RFID-Reader hängt hinter einem ESP32 und stellt eine kleine
 Status-Webseite bereit (Default: http://10.0.244.81/status). Die
 Antwort hat das Format:
 
-    {"status":"idle",      "user_id":"", "username":"",         "run_id":""}
-    {"status":"logged_in", "user_id":"d83751ae-...", "username":"Jonathan", ...}
+    {"status":"idle",      "userid":"", "username":"",         "runid":""}
+    {"status":"logged_in", "userid":"d83751ae-...", "username":"Jonathan",
+     "runid":"5", "time":178}
 
-Nur wenn ``status == "logged_in"`` wird die ``user_id`` zurückgegeben
+Nur wenn ``status == "logged_in"`` wird die ``userid`` zurückgegeben
 und ein Login im Spiel ausgelöst. Jeder andere Status (``idle``,
 ``logged_out``, ...) bedeutet "kein Chip aufgelegt".
 
@@ -36,8 +37,9 @@ log = logging.getLogger(__name__)
 # Nur dieser Status löst einen Login aus.
 POSITIVE_STATUS = "logged_in"
 
-# Bekannte Schlüssel, unter denen der Server die UUID liefert.
-_ID_KEYS = ("user_id", "userid", "uid")
+# Bekannte Schlüssel, unter denen der Server die UUID liefert
+# (aktuell "userid", früher "user_id").
+_ID_KEYS = ("userid", "user_id", "uid")
 
 # Bekannte Schlüssel, unter denen der Server den Anzeigenamen liefert.
 _NAME_KEYS = ("username", "user_name", "name", "display_name")
@@ -58,7 +60,7 @@ def _normalize_id(raw: str) -> str:
 
 
 def _extract_scan(payload) -> tuple[Optional[str], Optional[str]]:
-    """Liefert ``(user_id, username)`` aus der JSON-Antwort.
+    """Liefert ``(userid, username)`` aus der JSON-Antwort.
 
     Beide Werte sind ``None``, wenn der Status nicht ``logged_in`` ist oder
     kein ID-Feld befüllt wurde.

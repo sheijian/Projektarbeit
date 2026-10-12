@@ -231,7 +231,7 @@ class App:
             player.name = name
 
         log.info(
-            "Login: user_id=%s | name=%s | balance=%d",
+            "Login: userid=%s | name=%s | balance=%d",
             player.rfid, player.name, player.balance,
         )
         self.game.login(player, default_bet=self.args.default_bet)
@@ -294,7 +294,7 @@ class App:
         if self.rfid is not None and not self.rfid.logout():
             self.game.message = "RFID-Logout fehlgeschlagen - nochmal Logout"
             return
-        log.info("Logout: user_id=%s | name=%s | Endwert=%d gespeichert",
+        log.info("Logout: userid=%s | name=%s | Endwert=%d gespeichert",
                  player.rfid, player.name, player.balance)
         self.game.logout()
         self.game.message = f"Tschüss {player.name}! Endwert: {player.balance}"

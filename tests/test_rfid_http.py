@@ -7,6 +7,20 @@ from blackjack.rfid import HTTPRFIDReader, _extract_scan, _normalize_id
 # ---------------------------------------------------------------------------
 # Logins (status == "logged_in")
 # ---------------------------------------------------------------------------
+def test_current_esp32_format_with_userid():
+    """Aktuelles Format des ESP32 (userid / runid)."""
+    payload = {
+        "status": "logged_in",
+        "userid": "d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb",
+        "username": "Jonathan",
+        "runid": "5",
+        "time": 178,
+    }
+    assert _extract_scan(payload) == (
+        "d83751ae-8dfb-4a4b-bfbc-79bdcc54cdeb", "Jonathan",
+    )
+
+
 def test_logged_in_returns_uid_and_username():
     payload = {
         "status": "logged_in",
