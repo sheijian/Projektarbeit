@@ -8,10 +8,11 @@ Blackjack-Automat mit:
   `H` / `S` / `D` / `P` / `L`
 - **RFID-Reader hinter einem ESP32** als HTTP-Statusseite
   (Default: `http://10.0.244.81/status`)
-- **InfluxDB** – beim Chip-Auflegen wird der letzte Kontostand (`live`)
-  aus `SpieloAutomat` geladen bzw. beim ersten Spiel die Summe der sechs
-  Stationen als Startguthaben; nach jeder Hand wird `live` gespeichert,
-  am Ende jedes Durchlaufs zusätzlich der Glückswert (`endscore`)
+- **InfluxDB** – beim Chip-Auflegen: letzter Kontostand (`live`) aus
+  `SpieloAutomat` plus seitdem neu verdiente Stationspunkte bzw. beim
+  ersten Spiel die Summe der sechs Stationen; nach jeder Hand wird `live`
+  gespeichert, am Ende jedes Durchlaufs zusätzlich der Glückswert
+  (`endscore`)
 - **Logout** per Taster K5, Taste `L` oder LOGOUT-Button auf dem
   Bildschirm (Maus/Touch)
 
@@ -105,6 +106,7 @@ Alle Buckets nutzen dasselbe Schema:
 | Whackamole        | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
 | Gedaechtnistest   | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
 | **SpieloAutomat** | `durchlauf` | `live`     | `userid`   | **Kontostand** (nach jeder Hand) |
+| **SpieloAutomat** | `durchlauf` | `stationen`| `userid`   | Stationspunkte, die in `live` schon stecken |
 | **SpieloAutomat** | `durchlauf` | `endscore` | `userid`   | **Glückswert in %** (pro Durchlauf) |
 
 Bucket-Namen und Schema stehen oben in `blackjack/influx_db.py`
@@ -113,17 +115,24 @@ Bucket-Namen und Schema stehen oben in `blackjack/influx_db.py`
 **Achtung – Stand 12.10.:** Nicht alle Stationen schreiben schon das
 vereinbarte Schema; Gedaechtnistest z. B. noch `endscore` / `score` mit
 Tag `user_id` (+ `run_id`). Die Stations-Abfrage akzeptiert deshalb
-beide Varianten (`STATION_SCHEMAS`, `STATION_TAGS`). Was wirklich in
-der DB steht, zeigt `python -m scripts.punkte --schema`.
+beide Varianten (`STATION_SCHEMAS`) und die Tag-Namen `userid`,
+`user_id`, `rfidTag`, `userID` (`STATION_TAGS`). Was wirklich in der DB
+steht, zeigt `python -m scripts.punkte --schema`.
 
 **Beim Chip-Auflegen** (`query_balance`):
 
 1. Gibt es in `SpieloAutomat` schon einen Kontostand (`live`) für die
-   `userid`? → Spieler startet genau dort. (`endscore` = Glückswert wird
+   `userid`? → Guthaben = `live` **+ Stationspunkte, die seit dem letzten
+   Blackjack-Spiel dazugekommen sind** (aktuelle Stationssumme minus
+   `stationen`). So zählt z. B. ein späterer Whackamole-Durchlauf mit,
+   und nichts wird doppelt gerechnet. (`endscore` = Glückswert wird
    dafür **nie** benutzt.)
 2. Sonst: Summe aller Durchläufe aus den sechs Stations-Buckets
    → Startguthaben. Ein noch nicht angelegter Bucket zählt als 0.
 3. Gar keine Daten → `--starting-balance`.
+
+Beispiel: Gedächtnistest 79 → Blackjack bis 59 → Whackamole +73 →
+nächster Login startet mit 59 + 73 = 132.
 
 Antwortet die Datenbank nicht, wird **kein** Ersatzwert genommen (sonst
 würde der echte Kontostand nach der ersten Hand überschrieben) – das Spiel
@@ -134,8 +143,8 @@ Blackjack schreibt dorthin:
 
 | Wann                                   | Datenpunkt                                         |
 |----------------------------------------|----------------------------------------------------|
-| nach jeder Hand                        | `durchlauf,userid=<id> live=<kontostand>`          |
-| Ende des Durchlaufs (s. u.)            | `durchlauf,userid=<id> live=<kontostand>,endscore=<glück>` |
+| nach jeder Hand                        | `durchlauf,userid=<id> live=<kontostand>,stationen=<summe>` |
+| Ende des Durchlaufs (s. u.)            | `… live=<kontostand>,stationen=<summe>,endscore=<glück>` |
 
 **Glückswert** (`endscore`) = gewonnene Hände ÷ gespielte Hände × 100,
 kaufmännisch gerundet, als Ganzzahl – z. B. 5 von 10 → `50`,
@@ -159,9 +168,9 @@ Explorer mit „Past 1h“ unsichtbar.
 **Prüfen und zurücksetzen** (auf dem Pi, im Projektordner):
 
 ```bash
-python -m scripts.punkte <userid>            # Punkte je Station, Startguthaben, live, Glückswert
+python -m scripts.punkte <userid>            # Punkte je Station, live, Glückswert, nächster Startwert
 python -m scripts.punkte --schema            # was wirklich in jedem Bucket steht
-python -m scripts.punkte <userid> --reset    # live + endscore löschen -> wieder Startguthaben
+python -m scripts.punkte <userid> --reset    # SpieloAutomat-Daten löschen -> wieder Startguthaben
 ```
 
 ### Logout (Taster K5, Taste `L` oder LOGOUT antippen)

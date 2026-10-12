@@ -5,19 +5,24 @@ Alle Spielstationen speichern einheitlich:
     Bucket <Station>  measurement "durchlauf"  field "endscore"  tag "userid"
 
 Unser eigener Bucket ``SpieloAutomat`` (measurement "durchlauf", tag
-"userid") hat zwei Fields:
+"userid") hat drei Fields:
 
-    live      aktueller Kontostand - nach jeder Hand
-    endscore  Glückswert = gewonnene Hände / gespielte Hände in %
-              - einmal pro Durchlauf (Login bis Logout)
+    live       aktueller Kontostand - nach jeder Hand
+    stationen  Summe der Stationspunkte, die in ``live`` schon stecken
+               (immer zusammen mit live geschrieben)
+    endscore   Glückswert = gewonnene Hände / gespielte Hände in %
+               - einmal pro Durchlauf (Login bis Logout)
 
-    query_balance(userid)        -> int | None   Kontostand für den Login
-    query_live(userid)           -> int | None   letzter Kontostand (live)
-    query_glueck(userid)         -> int | None   letzter Glückswert (endscore)
-    query_station_points(userid) -> {bucket: punkte}  (die sechs Stationen)
-    query_username(userid)       -> str | None   Anzeigename (PPMaster)
-    write_spielstand(userid, live, glueck) -> bool  nach SpieloAutomat
-    delete_spielstand(userid)    -> bool         live + endscore löschen
+Guthaben beim Login = live + (Stationspunkte jetzt - stationen), d. h.
+Punkte, die nach dem letzten Blackjack-Spiel an einer Station dazukamen,
+werden dazugerechnet - ohne etwas doppelt zu zählen.
+
+    query_balance(userid)        -> Startwert | None   Guthaben für den Login
+    query_spielstand(userid)     -> {field: wert}      live/stationen/endscore
+    query_station_points(userid) -> {bucket: punkte}   die sechs Stationen
+    query_username(userid)       -> str | None         Anzeigename (PPMaster)
+    write_spielstand(userid, live, glueck, stationen) -> bool
+    delete_spielstand(userid)    -> bool         SpieloAutomat-Daten löschen
     list_schema(bucket)          -> [(measurement, field, tags)]  Diagnose
 
 Zugangsdaten (URL, Org, Tokens) stehen oben als Konstanten. Trage die
@@ -31,7 +36,7 @@ import csv
 import io
 import json
 import logging
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import requests
 
@@ -68,7 +73,9 @@ TAG         = "userid"
 # Gedaechtnistest noch endscore/score mit Tag user_id. Die Abfrage
 # akzeptiert beides - so zählen alte und neue Durchläufe.
 STATION_SCHEMAS = (("durchlauf", "endscore"), ("endscore", "score"))
-STATION_TAGS    = ("userid", "user_id")
+# Tag-Namen der RFID-ID - "rfidTag"/"userID" hatten Whackamole,
+# Ampelsequenz und HeisserDraht früher.
+STATION_TAGS    = ("userid", "user_id", "rfidTag", "userID")
 
 # Die sechs Spielstationen - ihre Summe ist das Startguthaben.
 STATION_BUCKETS = (
@@ -82,8 +89,9 @@ STATION_BUCKETS = (
 
 # Unser Bucket - schreibt NUR Blackjack (measurement/tag wie oben).
 SCORE_BUCKET = "SpieloAutomat"
-FIELD_LIVE   = "live"        # Kontostand, daraus startet der nächste Login
-FIELD_GLUECK = FIELD         # "endscore" = Glückswert in % (0..100)
+FIELD_LIVE      = "live"       # Kontostand, daraus startet der nächste Login
+FIELD_STATIONEN = "stationen"  # Stationspunkte, die in live schon stecken
+FIELD_GLUECK    = FIELD        # "endscore" = Glückswert in % (0..100)
 
 # PPMaster speichert pro RFID-Chip den Anzeigenamen (gefüllt vom ESP32).
 USERNAME_BUCKET      = "PPMaster"
@@ -125,13 +133,20 @@ def _is_configured() -> bool:
 # ---------------------------------------------------------------------------
 # Lesen
 # ---------------------------------------------------------------------------
-def query_balance(userid: str) -> Optional[int]:
-    """Kontostand für den Login.
+class Startwert(NamedTuple):
+    """Ergebnis von ``query_balance``."""
+    balance: int      # Guthaben für diesen Login
+    stationen: int    # aktuelle Summe der Stationspunkte (Basis für live)
+    quelle: str       # Erklärung für Log/Diagnose
 
-    Hat der Spieler schon Blackjack gespielt, ist das sein letzter
-    Kontostand (``live``) aus SpieloAutomat - sonst die Summe seiner
-    Punkte aus den sechs Stationen (Startguthaben). ``None``, wenn es
-    nirgends Daten gibt.
+
+def query_balance(userid: str) -> Optional[Startwert]:
+    """Guthaben für den Login.
+
+    - Schon Blackjack gespielt: letzter Kontostand (``live``) plus alle
+      Stationspunkte, die seitdem dazugekommen sind.
+    - Noch nie Blackjack: Summe der Stationspunkte (Startguthaben).
+    - Gar keine Daten: ``None``.
 
     Wirft ``DBError``, wenn die DB nicht antwortet - dann darf auf keinen
     Fall ein Ersatzwert genommen werden, sonst würde der echte Kontostand
@@ -140,41 +155,52 @@ def query_balance(userid: str) -> Optional[int]:
     if not _is_configured():
         log.warning("query_balance: InfluxDB nicht konfiguriert")
         return None
-    live = query_live(userid)
-    if live is not None:
-        log.info("query_balance: userid=%s -> %d (letzter Kontostand, live)",
-                 userid, live)
-        return live
     points = query_station_points(userid)
-    if not points:
+    stationen = sum(points.values())
+    stand = query_spielstand(userid)
+    live = stand.get(FIELD_LIVE)
+
+    if live is not None:
+        basis = stand.get(FIELD_STATIONEN)
+        if basis is None:
+            # Alter Datenpunkt ohne "stationen": annehmen, dass alle
+            # bisherigen Stationspunkte schon im Kontostand stecken.
+            neu = 0
+            quelle = f"live {live} (alter Datenpunkt ohne stationen)"
+        else:
+            neu = max(0, stationen - basis)
+            quelle = (f"live {live} + {neu} neue Stationspunkte "
+                      f"(jetzt {stationen}, beim letzten Spiel {basis})")
+        start = Startwert(live + neu, stationen, quelle)
+    elif points:
+        start = Startwert(stationen, stationen, f"Startguthaben aus {points}")
+    else:
         log.info("query_balance: keine Punkte für userid=%s", userid)
         return None
-    total = sum(points.values())
-    log.info("query_balance: userid=%s -> %d (Startguthaben aus %s)",
-             userid, total, points)
-    return total
+    log.info("query_balance: userid=%s -> %d (%s)",
+             userid, start.balance, start.quelle)
+    return start
 
 
-def query_live(userid: str) -> Optional[int]:
-    """Letzter Kontostand (``live``) aus SpieloAutomat. Wirft ``DBError``."""
-    return _query_last(userid, FIELD_LIVE)
-
-
-def query_glueck(userid: str) -> Optional[int]:
-    """Letzter Glückswert (``endscore``) aus SpieloAutomat. Wirft ``DBError``."""
-    return _query_last(userid, FIELD_GLUECK)
-
-
-def _query_last(userid: str, field: str) -> Optional[int]:
+def query_spielstand(userid: str) -> Dict[str, int]:
+    """Letzte Werte von live/stationen/endscore aus SpieloAutomat (nur die
+    vorhandenen). Wirft ``DBError``."""
+    fields = (FIELD_LIVE, FIELD_STATIONEN, FIELD_GLUECK)
+    field_match = " or ".join(f'r._field == "{f}"' for f in fields)
     flux = (
         f'from(bucket: "{SCORE_BUCKET}")\n'
         f'  |> range(start: 0)\n'
         f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
-        f'r._field == "{field}")\n'
-        f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(userid)}")\n'
+        f'r.{TAG} == "{_esc_q(userid)}")\n'
+        f'  |> filter(fn: (r) => {field_match})\n'
         f'  |> last()\n'
     )
-    return _to_int(_first_value(_run_query(flux)))
+    stand: Dict[str, int] = {}
+    for row in _rows(_run_query(flux)):
+        field, value = row.get("_field"), _to_int(row.get("_value") or None)
+        if field in fields and value is not None:
+            stand[field] = value
+    return stand
 
 
 def query_station_points(userid: str) -> Dict[str, int]:
@@ -239,11 +265,12 @@ def write_spielstand(
     userid: str,
     live: Optional[int] = None,
     glueck: Optional[int] = None,
+    stationen: Optional[int] = None,
 ) -> bool:
-    """Schreibt Kontostand (``live``) und/oder Glückswert (``endscore``)
-    in einen Datenpunkt nach SpieloAutomat::
+    """Schreibt Kontostand (``live`` + ``stationen``) und/oder Glückswert
+    (``endscore``) in einen Datenpunkt nach SpieloAutomat::
 
-        durchlauf,userid=<id> live=<kontostand>i,endscore=<glueck>i
+        durchlauf,userid=<id> live=<konto>i,stationen=<summe>i,endscore=<glück>i
     """
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
         log.warning("write_spielstand: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
@@ -251,6 +278,8 @@ def write_spielstand(
     fields = []
     if live is not None:
         fields.append(f"{FIELD_LIVE}={int(live)}i")
+        if stationen is not None:
+            fields.append(f"{FIELD_STATIONEN}={int(stationen)}i")
     if glueck is not None:
         fields.append(f"{FIELD_GLUECK}={int(glueck)}i")
     if not fields:

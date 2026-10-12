@@ -159,7 +159,18 @@ def test_station_points_reads_float_sum_from_real_db_answer():
     ))
     with _test_env(_FakeSession({"Gedaechtnistest": answer})):
         assert influx_db.query_station_points(UID) == {"Gedaechtnistest": 79}
-        assert influx_db.query_balance(UID) == 79
+        assert influx_db.query_balance(UID).balance == 79
+
+
+def test_station_points_accepts_old_tag_names():
+    """Whackamole/Ampelsequenz hatten früher den Tag rfidTag, HeisserDraht
+    userID - die Abfrage sucht auch danach."""
+    sess = _FakeSession()
+    with _test_env(sess):
+        influx_db.query_station_points(UID)
+    body = sess.calls[0]["body"]
+    for tag in ("userid", "user_id", "rfidTag", "userID"):
+        assert f'(exists r.{tag} and r.{tag} == "{UID}")' in body
 
 
 def test_station_points_skips_stations_without_data():
@@ -197,79 +208,90 @@ def test_station_points_raises_on_db_error():
 
 
 # ---------------------------------------------------------------------------
-# query_live / query_glueck / query_balance
+# query_spielstand / query_balance
 # ---------------------------------------------------------------------------
-class _FieldSession(_FakeSession):
-    """SpieloAutomat antwortet je nach abgefragtem Field (live/endscore)."""
-
-    def __init__(self, fields, buckets=None):
-        super().__init__(buckets)
-        self.fields = fields
-
-    def post(self, url, params=None, headers=None, data=None, timeout=None):
-        body = data.decode("utf-8") if isinstance(data, bytes) else data
-        m = re.search(r'from\(bucket: "SpieloAutomat"\).*r\._field == "(\w+)"',
-                      body, re.S)
-        if m:
-            self.calls.append({"url": url, "params": params,
-                               "headers": headers, "body": body})
-            return self.fields.get(m.group(1), _Response(text=EMPTY_CSV))
-        return super().post(url, params, headers, data, timeout)
+def _stand_csv(**fields):
+    """Antwort auf query_spielstand: eine Zeile je Field (last())."""
+    out = (
+        "#datatype,string,long,long,string\r\n"
+        "#group,false,false,false,true\r\n"
+        "#default,_result,,,\r\n"
+        ",result,table,_value,_field\r\n"
+    )
+    for i, (field, value) in enumerate(fields.items()):
+        out += f",,{i},{value},{field}\r\n"
+    return _Response(text=out)
 
 
-def test_query_live_reads_spieloautomat_live_field():
-    sess = _FakeSession({"SpieloAutomat": _Response(text=LIVE_CSV)})
+def test_query_spielstand_reads_all_fields_in_one_query():
+    sess = _FakeSession({"SpieloAutomat": _stand_csv(
+        live=69, stationen=21, endscore=50)})
     with _test_env(sess):
-        assert influx_db.query_live(UID) == 125
+        assert influx_db.query_spielstand(UID) == {
+            "live": 69, "stationen": 21, "endscore": 50,
+        }
+    assert len(sess.calls) == 1
     body = sess.calls[0]["body"]
     assert 'from(bucket: "SpieloAutomat")' in body
-    assert 'r._measurement == "durchlauf" and r._field == "live"' in body
-    assert f'r.userid == "{UID}"' in body
+    assert f'r._measurement == "durchlauf" and r.userid == "{UID}"' in body
+    for field in ("live", "stationen", "endscore"):
+        assert f'r._field == "{field}"' in body
     assert "|> last()" in body
 
 
-def test_query_glueck_reads_endscore_field():
-    sess = _FieldSession({"endscore": _value_csv(50)})
-    with _test_env(sess):
-        assert influx_db.query_glueck(UID) == 50
-
-
-def test_query_balance_uses_live_never_the_luck_score():
-    """endscore in SpieloAutomat ist jetzt der Glückswert (%) - der darf
-    niemals als Guthaben geladen werden."""
-    sess = _FieldSession({"live": _value_csv(69), "endscore": _value_csv(50)},
-                         {"HeisserDraht": _value_csv(21)})
-    with _test_env(sess):
-        assert influx_db.query_balance(UID) == 69
-
-
-def test_query_balance_luck_score_alone_is_no_balance():
-    """Nur ein Glückswert, aber (noch) kein live -> Startguthaben."""
-    sess = _FieldSession({"endscore": _value_csv(50)},
-                         {"HeisserDraht": _value_csv(21)})
-    with _test_env(sess):
-        assert influx_db.query_balance(UID) == 21
-
-
-def test_query_balance_prefers_live():
+def test_balance_adds_station_points_earned_after_blackjack():
+    """Der Fall aus dem Chat: Karte hat schon einen Blackjack-Kontostand,
+    danach 73 Punkte bei Whackamole -> die 73 kommen dazu."""
     sess = _FakeSession({
-        "SpieloAutomat": _value_csv(1),
+        "SpieloAutomat":   _stand_csv(live=69, stationen=79),
+        "Gedaechtnistest": _value_csv(79),
+        "Whackamole":      _value_csv(73),
+    })
+    with _test_env(sess):
+        start = influx_db.query_balance(UID)
+    assert start.balance == 69 + 73
+    assert start.stationen == 79 + 73          # neue Basis für live
+
+
+def test_balance_counts_station_points_only_once():
+    """Keine neuen Stationspunkte -> genau der letzte Kontostand."""
+    sess = _FakeSession({
+        "SpieloAutomat": _stand_csv(live=69, stationen=79),
+        "Gedaechtnistest": _value_csv(79),
+    })
+    with _test_env(sess):
+        assert influx_db.query_balance(UID).balance == 69
+
+
+def test_balance_old_live_without_stationen_counts_nothing_twice():
+    """Alter Datenpunkt ohne "stationen": vorsichtshalber nichts addieren."""
+    sess = _FakeSession({
+        "SpieloAutomat": _stand_csv(live=69),
+        "Gedaechtnistest": _value_csv(79),
+    })
+    with _test_env(sess):
+        start = influx_db.query_balance(UID)
+    assert (start.balance, start.stationen) == (69, 79)
+
+
+def test_balance_never_uses_the_luck_score():
+    """endscore in SpieloAutomat ist der Glückswert (%) - nie Guthaben."""
+    sess = _FakeSession({
+        "SpieloAutomat": _stand_csv(endscore=50),
         "HeisserDraht":  _value_csv(21),
     })
     with _test_env(sess):
-        assert influx_db.query_balance(UID) == 1
-    # Mit Kontostand müssen die Stationen gar nicht erst gefragt werden.
-    assert sess.queried() == ["SpieloAutomat"]
+        assert influx_db.query_balance(UID).balance == 21
 
 
-def test_query_balance_live_zero_is_kept():
+def test_balance_live_zero_is_kept():
     """Kontostand 0 (alles verspielt) ist ein gültiger Wert, kein "leer"."""
     sess = _FakeSession({
-        "SpieloAutomat": _value_csv(0),
+        "SpieloAutomat": _stand_csv(live=0, stationen=21),
         "HeisserDraht":  _value_csv(21),
     })
     with _test_env(sess):
-        assert influx_db.query_balance(UID) == 0
+        assert influx_db.query_balance(UID).balance == 0
 
 
 def test_query_balance_sums_stations_as_startguthaben():
@@ -279,7 +301,8 @@ def test_query_balance_sums_stations_as_startguthaben():
         "Gedaechtnistest": _value_csv(12),
     })
     with _test_env(sess):
-        assert influx_db.query_balance(UID) == 21
+        start = influx_db.query_balance(UID)
+    assert (start.balance, start.stationen) == (21, 21)
 
 
 def test_query_balance_none_without_any_data():
@@ -360,6 +383,24 @@ def test_write_spielstand_live_and_luck_in_one_point():
     assert sess.calls[0]["body"].strip().splitlines() == [
         f"durchlauf,userid={UID} live=69i,endscore=50i",
     ]
+
+
+def test_write_spielstand_stores_station_basis_with_live():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_spielstand(UID, live=69, glueck=50,
+                                          stationen=79)
+    assert sess.calls[0]["body"].strip() == (
+        f"durchlauf,userid={UID} live=69i,stationen=79i,endscore=50i"
+    )
+
+
+def test_write_spielstand_no_basis_without_live():
+    """stationen gehört immer zu live - nur Glückswert -> kein stationen."""
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_spielstand(UID, glueck=67, stationen=79)
+    assert sess.calls[0]["body"].strip() == f"durchlauf,userid={UID} endscore=67i"
 
 
 def test_write_spielstand_luck_only():

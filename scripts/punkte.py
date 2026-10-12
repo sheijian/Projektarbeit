@@ -33,26 +33,30 @@ def show_points(uid: str) -> int:
     print(f"userid {uid}")
     print(f"Stationen: {schemas}, Tag {' oder '.join(influx_db.STATION_TAGS)}\n")
     points = influx_db.query_station_points(uid)
-    live = influx_db.query_live(uid)
-    glueck = influx_db.query_glueck(uid)
+    stand = influx_db.query_spielstand(uid)
 
     for bucket in influx_db.STATION_BUCKETS:
         value = points.get(bucket)
         print(f"  {bucket:<18} {'-' if value is None else value:>6}")
-    print(f"  {'= Startguthaben':<18} {sum(points.values()):>6}\n")
-    where = f"{influx_db.SCORE_BUCKET}/{influx_db.MEASUREMENT}"
-    print(f"  Kontostand  ({where}/{influx_db.FIELD_LIVE}): "
-          f"{'noch keiner' if live is None else live}")
-    print(f"  Glückswert  ({where}/{influx_db.FIELD_GLUECK}, letzter "
-          f"Durchlauf): {'noch keiner' if glueck is None else f'{glueck} %'}")
+    print(f"  {'= Stationspunkte':<18} {sum(points.values()):>6}\n")
 
-    if live is not None:
-        start = f"{live} (letzter Kontostand)"
-    elif points:
-        start = f"{sum(points.values())} (Startguthaben)"
+    def show(field: str, label: str, unit: str = "") -> None:
+        value = stand.get(field)
+        text = "noch keiner" if value is None else f"{value}{unit}"
+        print(f"  {label:<44} {text}")
+
+    where = f"{influx_db.SCORE_BUCKET}/{influx_db.MEASUREMENT}"
+    show(influx_db.FIELD_LIVE, f"Kontostand ({where}/{influx_db.FIELD_LIVE})")
+    show(influx_db.FIELD_STATIONEN, "  davon Stationspunkte (stationen)")
+    show(influx_db.FIELD_GLUECK, f"Glückswert ({influx_db.FIELD_GLUECK}, "
+         f"letzter Durchlauf)", " %")
+
+    start = influx_db.query_balance(uid)
+    if start is None:
+        print("\n  Nächster Login startet mit: keine Daten -> --starting-balance")
     else:
-        start = "keine Daten -> --starting-balance"
-    print(f"  Nächster Login startet mit: {start}")
+        print(f"\n  Nächster Login startet mit: {start.balance}")
+        print(f"    ({start.quelle})")
     return 0
 
 

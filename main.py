@@ -143,6 +143,9 @@ class App:
         # session_plays beim letzten Glückswert-Write - verhindert, dass ein
         # Durchlauf doppelt gespeichert wird (z. B. Logout zweimal gedrückt).
         self._glueck_saved_plays = 0
+        # Stationspunkte, die im Guthaben dieses Durchlaufs schon stecken -
+        # wird mit jedem live gespeichert (Field "stationen").
+        self._stationen = 0
 
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
@@ -209,10 +212,10 @@ class App:
         if self.game.player is not None and self.game.player.rfid != uid:
             self._finish_session()
 
-        # 1) Kontostand: letzter Kontostand (live) aus SpieloAutomat, falls
-        #    der Spieler schon gespielt hat - sonst Summe der sechs Stationen.
+        # 1) Guthaben: letzter Kontostand (live) + seitdem neue
+        #    Stationspunkte - sonst Summe der sechs Stationen.
         try:
-            score = influx_db.query_balance(uid)
+            start = influx_db.query_balance(uid)
         except influx_db.DBError as e:
             # Kein Ersatzwert - sonst würde der echte Kontostand nach der
             # ersten Hand überschrieben. Später nochmal versuchen.
@@ -222,14 +225,16 @@ class App:
             self.game.message = "Datenbank nicht erreichbar - neuer Versuch ..."
             self._login_retry = (uid, time.monotonic() + LOGIN_RETRY_SECONDS)
             return
-        if score is None:
+        if start is None:
             log.warning(
                 "Keine Punkte für userid=%s (weder live noch Stationen) "
                 "- nehme Fallback %d",
                 uid, self.args.starting_balance,
             )
+            self._stationen = 0
         else:
-            self.store.set_balance(uid, score)
+            self.store.set_balance(uid, start.balance)
+            self._stationen = start.stationen
         player = self.store.get_player(uid)
 
         # 2) Anzeigename aus PPMaster, Fallback ESP32.
@@ -266,6 +271,7 @@ class App:
             return
         log.info("Auto-Login: %s (Guthaben %d)", player.name, player.balance)
         self._glueck_saved_plays = 0
+        self._stationen = 0
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
@@ -306,7 +312,10 @@ class App:
                         live, glueck)
             return True
         try:
-            return influx_db.write_spielstand(player.rfid, live=live, glueck=glueck)
+            return influx_db.write_spielstand(
+                player.rfid, live=live, glueck=glueck,
+                stationen=self._stationen,
+            )
         except Exception as e:
             log.warning("write_spielstand fehlgeschlagen: %s", e)
             return False
