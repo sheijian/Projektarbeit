@@ -109,6 +109,12 @@ Alle Buckets nutzen dasselbe Schema:
 Bucket-Namen und Schema stehen oben in `blackjack/influx_db.py`
 (`STATION_BUCKETS`, `MEASUREMENT`, `FIELD`, `TAG`).
 
+**Achtung – Stand 12.10.:** Nicht alle Stationen schreiben schon das
+vereinbarte Schema; Gedaechtnistest z. B. noch `endscore` / `score` mit
+Tag `user_id` (+ `run_id`). Die Stations-Abfrage akzeptiert deshalb
+beide Varianten (`STATION_SCHEMAS`, `STATION_TAGS`). Was wirklich in
+der DB steht, zeigt `python -m scripts.punkte --schema`.
+
 **Beim Chip-Auflegen** (`query_balance`):
 
 1. Gibt es in `SpieloAutomat` schon einen Endwert für die `userid`?
@@ -123,21 +129,22 @@ zeigt „Datenbank nicht erreichbar“ und versucht es alle 5 s erneut.
 
 **Gespeichert** wird der Endwert (`write_endwert`) nach jeder Hand und
 beim Logout als `durchlauf,userid=<id> endscore=<wert>` in
-`SpieloAutomat`. Nur Blackjack schreibt dorthin.
+`SpieloAutomat`. Nur Blackjack schreibt dorthin. Wer sich abmeldet,
+ohne eine Hand gespielt zu haben, bekommt **keinen** Endwert – sonst
+würde ein (evtl. falsches) Startguthaben festgeschrieben.
 
 Beim Schreiben wird **kein Zeitstempel** mitgeschickt – InfluxDB setzt
 die Serverzeit. Die Uhr des Pi geht ohne Internet/NTP falsch;
 Datenpunkte mit Pi-Zeit landeten z. B. am 19.09. und waren im Data
 Explorer mit „Past 1h“ unsichtbar.
 
-**Punkte eines Spielers prüfen** (auf dem Pi):
+**Prüfen und zurücksetzen** (auf dem Pi, im Projektordner):
 
 ```bash
-python -m scripts.punkte 7c3ed021-5099-4d46-9283-002adf814597
+python -m scripts.punkte <userid>                  # Punkte je Station, Startguthaben, Endwert
+python -m scripts.punkte --schema                  # was wirklich in jedem Bucket steht
+python -m scripts.punkte <userid> --reset-endwert  # Endwert löschen -> wieder Startguthaben
 ```
-
-zeigt die Punkte je Station, das Startguthaben, den Blackjack-Endwert
-und womit der Spieler beim nächsten Login startet.
 
 ### Logout (Taster K5, Taste `L` oder LOGOUT antippen)
 

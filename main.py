@@ -288,14 +288,20 @@ class App:
         if not self.game.can_logout:
             self.game.message = "Erst die Runde zu Ende spielen"
             return
-        if not self._save_endwert(player):
+        # Nur speichern, wenn wirklich gespielt wurde - sonst würde z. B. ein
+        # (falsches) Startguthaben als Endwert festgeschrieben und hätte ab
+        # dann Vorrang vor allen Stationspunkten.
+        if self.game.session_plays > 0 and not self._save_endwert(player):
             self.game.message = "Speichern fehlgeschlagen - nochmal Logout"
             return
         if self.rfid is not None and not self.rfid.logout():
             self.game.message = "RFID-Logout fehlgeschlagen - nochmal Logout"
             return
-        log.info("Logout: userid=%s | name=%s | Endwert=%d gespeichert",
-                 player.rfid, player.name, player.balance)
+        log.info("Logout: userid=%s | name=%s | %d Hände | Endwert=%d%s",
+                 player.rfid, player.name, self.game.session_plays,
+                 player.balance,
+                 " gespeichert" if self.game.session_plays else
+                 " (nicht gespielt - nichts gespeichert)")
         self.game.logout()
         self.game.message = f"Tschüss {player.name}! Endwert: {player.balance}"
 

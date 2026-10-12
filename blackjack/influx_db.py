@@ -12,6 +12,8 @@ der Blackjack-Endwert, zuordenbar über die ``userid``.
     query_station_points(userid) -> {bucket: punkte}  (die sechs Stationen)
     query_username(userid)       -> str | None   Anzeigename (PPMaster)
     write_endwert(userid, wert)  -> bool         Endwert nach SpieloAutomat
+    delete_endwert(userid)       -> bool         Endwert löschen (Testspieler)
+    list_schema(bucket)          -> [(measurement, field, tags)]  Diagnose
 
 Zugangsdaten (URL, Org, Tokens) stehen oben als Konstanten. Trage die
 Tokens direkt in dieser Datei ein - die Datei ist der einzige Ort, an
@@ -22,8 +24,9 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import requests
 
@@ -54,6 +57,13 @@ INFLUX_TOKEN_WRITE = ""
 MEASUREMENT = "durchlauf"
 FIELD       = "endscore"      # int
 TAG         = "userid"
+
+# Was die Stationen TATSÄCHLICH schreiben: Vereinbart ist
+# durchlauf/endscore/userid, in der DB stand am 12.10. aber z. B. bei
+# Gedaechtnistest noch endscore/score mit Tag user_id. Die Abfrage
+# akzeptiert beides - so zählen alte und neue Durchläufe.
+STATION_SCHEMAS = (("durchlauf", "endscore"), ("endscore", "score"))
+STATION_TAGS    = ("userid", "user_id")
 
 # Die sechs Spielstationen - ihre Summe ist das Startguthaben.
 STATION_BUCKETS = (
@@ -151,17 +161,18 @@ def query_endwert(userid: str) -> Optional[int]:
 
 
 def query_station_points(userid: str) -> Dict[str, int]:
-    """Punkte pro Station (Summe aller Durchläufe). Stationen ohne Daten
-    fehlen im Ergebnis. Ein noch nicht angelegter Bucket zählt als 0,
-    jeder andere Fehler wirft ``DBError``."""
+    """Punkte pro Station (Summe aller Durchläufe, siehe STATION_SCHEMAS).
+    Stationen ohne Daten fehlen im Ergebnis. Ein noch nicht angelegter
+    Bucket zählt als 0, jeder andere Fehler wirft ``DBError``."""
     points: Dict[str, int] = {}
     for bucket in STATION_BUCKETS:
         flux = (
             f'from(bucket: "{bucket}")\n'
             f'  |> range(start: 0)\n'
-            f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
-            f'r._field == "{FIELD}")\n'
-            f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(userid)}")\n'
+            f'  |> filter(fn: (r) => {_schema_match(STATION_SCHEMAS)})\n'
+            f'  |> filter(fn: (r) => {_tag_match(STATION_TAGS, userid)})\n'
+            # int und float dürfen beim group() nicht gemischt werden.
+            f'  |> toFloat()\n'
             f'  |> group()\n'
             f'  |> sum()\n'
         )
@@ -242,6 +253,65 @@ def write_endwert(userid: str, endwert: int) -> bool:
     return True
 
 
+def delete_endwert(userid: str) -> bool:
+    """Löscht alle Blackjack-Endwerte eines Spielers in SpieloAutomat -
+    danach startet er wieder mit dem Startguthaben (für Testspieler)."""
+    if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
+        log.warning("delete_endwert: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
+        return False
+    body = {
+        "start": "1970-01-01T00:00:00Z",
+        "stop": "2100-01-01T00:00:00Z",
+        "predicate": f'_measurement="{MEASUREMENT}" AND '
+                     f'{TAG}="{_esc_q(userid)}"',
+    }
+    try:
+        r = _get_session().post(
+            f"{INFLUX_URL}/api/v2/delete",
+            params={"org": INFLUX_ORG, "bucket": SCORE_BUCKET},
+            headers={
+                "Authorization": f"Token {INFLUX_TOKEN_WRITE}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(body).encode("utf-8"),
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.warning("delete_endwert: Netzwerkfehler %s", e)
+        return False
+    if not r.ok:
+        log.warning("delete_endwert HTTP %s: %s", r.status_code, r.text[:200])
+        return False
+    log.info("delete_endwert OK: %s userid=%s", SCORE_BUCKET, userid)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Diagnose
+# ---------------------------------------------------------------------------
+_STANDARD_COLUMNS = {
+    "", "result", "table", "_start", "_stop", "_time", "_value",
+    "_field", "_measurement",
+}
+
+
+def list_schema(bucket: str) -> List[Tuple[str, str, Tuple[str, ...]]]:
+    """Welche (measurement, field, tags) es in einem Bucket wirklich gibt.
+    Wirft ``DBError``."""
+    flux = (
+        f'from(bucket: "{bucket}")\n'
+        f'  |> range(start: 0)\n'
+        f'  |> limit(n: 1)\n'
+    )
+    found = set()
+    for row in _rows(_run_query(flux)):
+        tags = tuple(sorted(
+            k for k, v in row.items() if k not in _STANDARD_COLUMNS and v
+        ))
+        found.add((row.get("_measurement", ""), row.get("_field", ""), tags))
+    return sorted(found)
+
+
 # ---------------------------------------------------------------------------
 # HTTP + Parser-Helfer
 # ---------------------------------------------------------------------------
@@ -301,6 +371,13 @@ def _to_int(value: Optional[str]) -> Optional[int]:
         return int(float(value))
     except ValueError:
         raise DBError(f"nicht-numerischer Wert {value!r}") from None
+
+
+def _schema_match(pairs) -> str:
+    """Flux-Bedingung "eins der (measurement, field)-Paare passt"."""
+    return " or ".join(
+        f'(r._measurement == "{m}" and r._field == "{f}")' for m, f in pairs
+    )
 
 
 def _tag_match(tags, value: str) -> str:

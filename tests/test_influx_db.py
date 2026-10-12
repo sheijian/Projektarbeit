@@ -33,7 +33,7 @@ class _FakeSession:
         self.calls.append({
             "url": url, "params": params, "headers": headers, "body": body,
         })
-        if url.endswith("/write"):
+        if url.endswith("/write") or url.endswith("/delete"):
             return _Response(ok=self.writes_ok,
                              status_code=204 if self.writes_ok else 500)
         bucket = re.search(r'from\(bucket: "([^"]+)"\)', body).group(1)
@@ -130,16 +130,36 @@ def test_unified_schema():
 # ---------------------------------------------------------------------------
 # query_station_points
 # ---------------------------------------------------------------------------
-def test_station_points_queries_all_six_with_unified_schema():
+def test_station_points_queries_all_six_with_both_schemas():
+    """Vereinbart ist durchlauf/endscore/userid - in der DB steht aber z. B.
+    bei Gedaechtnistest noch endscore/score/user_id. Beides muss zählen."""
     sess = _FakeSession()
     with _test_env(sess):
         influx_db.query_station_points(UID)
     assert sess.queried() == list(influx_db.STATION_BUCKETS)
     for call in sess.calls:
         body = call["body"]
-        assert 'r._measurement == "durchlauf" and r._field == "endscore"' in body
-        assert f'r.userid == "{UID}"' in body
+        assert '(r._measurement == "durchlauf" and r._field == "endscore")' in body
+        assert '(r._measurement == "endscore" and r._field == "score")' in body
+        assert f'(exists r.userid and r.userid == "{UID}")' in body
+        assert f'(exists r.user_id and r.user_id == "{UID}")' in body
+        assert "|> toFloat()" in body
         assert "|> group()" in body and "|> sum()" in body
+
+
+def test_station_points_reads_float_sum_from_real_db_answer():
+    """Antwort, wie InfluxDB sie nach toFloat()+sum() liefert (Gedaechtnistest,
+    Wert 79 vom 12.10.)."""
+    answer = _Response(text=(
+        "#datatype,string,long,double\r\n"
+        "#group,false,false,false\r\n"
+        "#default,_result,,\r\n"
+        ",result,table,_value\r\n"
+        ",,0,79\r\n"
+    ))
+    with _test_env(_FakeSession({"Gedaechtnistest": answer})):
+        assert influx_db.query_station_points(UID) == {"Gedaechtnistest": 79}
+        assert influx_db.query_balance(UID) == 79
 
 
 def test_station_points_skips_stations_without_data():
@@ -290,6 +310,35 @@ def test_write_endwert_uses_unified_schema():
     assert call["body"].strip().splitlines() == [
         f"durchlauf,userid={UID} endscore=1i",
     ]
+
+
+def test_delete_endwert_targets_only_this_player_in_spieloautomat():
+    import json
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.delete_endwert(UID) is True
+    call = sess.calls[0]
+    assert call["url"] == "http://example.local/api/v2/delete"
+    assert call["params"] == {"org": "o", "bucket": "SpieloAutomat"}
+    assert call["headers"]["Authorization"] == "Token tw"
+    body = json.loads(call["body"])
+    assert body["predicate"] == f'_measurement="durchlauf" AND userid="{UID}"'
+
+
+def test_list_schema_shows_measurement_field_and_tags():
+    # So sah Gedaechtnistest am 12.10. aus (curl-Ausgabe aus dem Chat).
+    answer = _Response(text=(
+        ",result,table,_start,_stop,_time,_value,_field,_measurement,"
+        "run_id,user_id\r\n"
+        ",_result,0,1970-01-01T00:00:00Z,2026-10-12T09:52:21Z,"
+        "2026-10-12T09:04:11Z,100,score,endscore,0,dcac539e\r\n"
+        ",_result,1,1970-01-01T00:00:00Z,2026-10-12T09:52:21Z,"
+        f"2026-10-12T08:34:49Z,79,score,endscore,5,{UID}\r\n"
+    ))
+    with _test_env(_FakeSession({"Gedaechtnistest": answer})):
+        assert influx_db.list_schema("Gedaechtnistest") == [
+            ("endscore", "score", ("run_id", "user_id")),
+        ]
 
 
 def test_write_endwert_returns_false_when_not_configured():
