@@ -2,21 +2,21 @@
 
 Aufruf (auf dem Pi, im Projektordner):
 
-    python -m scripts.punkte <userid>                  # Punkte + Endwert
-    python -m scripts.punkte --schema                  # echtes DB-Schema
-    python -m scripts.punkte <userid> --reset-endwert  # Endwert löschen
+    python -m scripts.punkte <userid>            # Punkte, Kontostand, Glück
+    python -m scripts.punkte --schema            # echtes DB-Schema
+    python -m scripts.punkte <userid> --reset    # Spielstand löschen
 
-Ohne Option: Punkte jeder Station, Summe (Startguthaben), Blackjack-
-Endwert aus SpieloAutomat und der Wert, mit dem der Spieler beim
-nächsten Einloggen startet.
+Ohne Option: Punkte jeder Station, Summe (Startguthaben), letzter
+Kontostand (live) und Glückswert (endscore) aus SpieloAutomat und der
+Wert, mit dem der Spieler beim nächsten Einloggen startet.
 
 ``--schema`` listet für jeden Bucket, welche measurement/field/tags dort
 wirklich stehen - so sieht man, ob eine Station ein anderes Schema
 schreibt als vereinbart.
 
-``--reset-endwert`` löscht den Blackjack-Endwert des Spielers; danach
-startet er wieder mit dem Startguthaben (zum Zurücksetzen von
-Testspielern).
+``--reset`` löscht Kontostand und Glückswerte des Spielers in
+SpieloAutomat; danach startet er wieder mit dem Startguthaben (zum
+Zurücksetzen von Testspielern).
 """
 
 from __future__ import annotations
@@ -33,18 +33,21 @@ def show_points(uid: str) -> int:
     print(f"userid {uid}")
     print(f"Stationen: {schemas}, Tag {' oder '.join(influx_db.STATION_TAGS)}\n")
     points = influx_db.query_station_points(uid)
-    endwert = influx_db.query_endwert(uid)
+    live = influx_db.query_live(uid)
+    glueck = influx_db.query_glueck(uid)
 
     for bucket in influx_db.STATION_BUCKETS:
         value = points.get(bucket)
         print(f"  {bucket:<18} {'-' if value is None else value:>6}")
     print(f"  {'= Startguthaben':<18} {sum(points.values()):>6}\n")
-    print(f"  Blackjack-Endwert ({influx_db.SCORE_BUCKET}/"
-          f"{influx_db.MEASUREMENT}/{influx_db.FIELD}): "
-          f"{'noch keiner' if endwert is None else endwert}")
+    where = f"{influx_db.SCORE_BUCKET}/{influx_db.MEASUREMENT}"
+    print(f"  Kontostand  ({where}/{influx_db.FIELD_LIVE}): "
+          f"{'noch keiner' if live is None else live}")
+    print(f"  Glückswert  ({where}/{influx_db.FIELD_GLUECK}, letzter "
+          f"Durchlauf): {'noch keiner' if glueck is None else f'{glueck} %'}")
 
-    if endwert is not None:
-        start = f"{endwert} (Blackjack-Endwert)"
+    if live is not None:
+        start = f"{live} (letzter Kontostand)"
     elif points:
         start = f"{sum(points.values())} (Startguthaben)"
     else:
@@ -70,9 +73,9 @@ def show_schema() -> int:
     return 0
 
 
-def reset_endwert(uid: str) -> int:
-    if influx_db.delete_endwert(uid):
-        print(f"Endwert für {uid} gelöscht - nächster Login startet mit "
+def reset(uid: str) -> int:
+    if influx_db.delete_spielstand(uid):
+        print(f"Spielstand für {uid} gelöscht - nächster Login startet mit "
               f"dem Startguthaben.")
         return 0
     print("Löschen fehlgeschlagen (Schreib-Token? Log oben beachten).")
@@ -84,8 +87,8 @@ def main() -> int:
     p.add_argument("userid", nargs="?")
     p.add_argument("--schema", action="store_true",
                    help="measurement/field/tags aller Buckets anzeigen")
-    p.add_argument("--reset-endwert", action="store_true",
-                   help="Blackjack-Endwert des Spielers löschen")
+    p.add_argument("--reset", action="store_true",
+                   help="Kontostand + Glückswerte des Spielers löschen")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.WARNING,
@@ -100,8 +103,8 @@ def main() -> int:
             p.print_help()
             return 2
         uid = args.userid.strip()
-        if args.reset_endwert:
-            return reset_endwert(uid)
+        if args.reset:
+            return reset(uid)
         return show_points(uid)
     except influx_db.DBError as e:
         print(f"Datenbank-Fehler: {e}")

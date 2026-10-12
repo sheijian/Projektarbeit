@@ -84,14 +84,14 @@ def _value_csv(value):
     ))
 
 
-ENDWERT_CSV = (
+LIVE_CSV = (
     "#datatype,string,long,dateTime:RFC3339,dateTime:RFC3339,"
     "dateTime:RFC3339,long,string,string,string\r\n"
     "#group,false,false,true,true,false,false,true,true,true\r\n"
     "#default,_result,,,,,,,,\r\n"
     ",result,table,_start,_stop,_time,_value,_field,_measurement,userid\r\n"
     ",,0,1970-01-01T00:00:00Z,2026-10-12T10:00:00Z,"
-    f"2026-10-12T09:00:00Z,125,endscore,durchlauf,{UID}\r\n"
+    f"2026-10-12T09:00:00Z,125,live,durchlauf,{UID}\r\n"
 )
 
 USERNAME_CSV = (
@@ -197,32 +197,73 @@ def test_station_points_raises_on_db_error():
 
 
 # ---------------------------------------------------------------------------
-# query_endwert / query_balance
+# query_live / query_glueck / query_balance
 # ---------------------------------------------------------------------------
-def test_query_endwert_reads_spieloautomat():
-    sess = _FakeSession({"SpieloAutomat": _Response(text=ENDWERT_CSV)})
+class _FieldSession(_FakeSession):
+    """SpieloAutomat antwortet je nach abgefragtem Field (live/endscore)."""
+
+    def __init__(self, fields, buckets=None):
+        super().__init__(buckets)
+        self.fields = fields
+
+    def post(self, url, params=None, headers=None, data=None, timeout=None):
+        body = data.decode("utf-8") if isinstance(data, bytes) else data
+        m = re.search(r'from\(bucket: "SpieloAutomat"\).*r\._field == "(\w+)"',
+                      body, re.S)
+        if m:
+            self.calls.append({"url": url, "params": params,
+                               "headers": headers, "body": body})
+            return self.fields.get(m.group(1), _Response(text=EMPTY_CSV))
+        return super().post(url, params, headers, data, timeout)
+
+
+def test_query_live_reads_spieloautomat_live_field():
+    sess = _FakeSession({"SpieloAutomat": _Response(text=LIVE_CSV)})
     with _test_env(sess):
-        assert influx_db.query_endwert(UID) == 125
+        assert influx_db.query_live(UID) == 125
     body = sess.calls[0]["body"]
     assert 'from(bucket: "SpieloAutomat")' in body
-    assert 'r._measurement == "durchlauf" and r._field == "endscore"' in body
+    assert 'r._measurement == "durchlauf" and r._field == "live"' in body
     assert f'r.userid == "{UID}"' in body
     assert "|> last()" in body
 
 
-def test_query_balance_prefers_blackjack_endwert():
+def test_query_glueck_reads_endscore_field():
+    sess = _FieldSession({"endscore": _value_csv(50)})
+    with _test_env(sess):
+        assert influx_db.query_glueck(UID) == 50
+
+
+def test_query_balance_uses_live_never_the_luck_score():
+    """endscore in SpieloAutomat ist jetzt der Glückswert (%) - der darf
+    niemals als Guthaben geladen werden."""
+    sess = _FieldSession({"live": _value_csv(69), "endscore": _value_csv(50)},
+                         {"HeisserDraht": _value_csv(21)})
+    with _test_env(sess):
+        assert influx_db.query_balance(UID) == 69
+
+
+def test_query_balance_luck_score_alone_is_no_balance():
+    """Nur ein Glückswert, aber (noch) kein live -> Startguthaben."""
+    sess = _FieldSession({"endscore": _value_csv(50)},
+                         {"HeisserDraht": _value_csv(21)})
+    with _test_env(sess):
+        assert influx_db.query_balance(UID) == 21
+
+
+def test_query_balance_prefers_live():
     sess = _FakeSession({
         "SpieloAutomat": _value_csv(1),
         "HeisserDraht":  _value_csv(21),
     })
     with _test_env(sess):
         assert influx_db.query_balance(UID) == 1
-    # Mit Endwert müssen die Stationen gar nicht erst gefragt werden.
+    # Mit Kontostand müssen die Stationen gar nicht erst gefragt werden.
     assert sess.queried() == ["SpieloAutomat"]
 
 
-def test_query_balance_endwert_zero_is_kept():
-    """Endwert 0 (alles verspielt) ist ein gültiger Wert, kein "leer"."""
+def test_query_balance_live_zero_is_kept():
+    """Kontostand 0 (alles verspielt) ist ein gültiger Wert, kein "leer"."""
     sess = _FakeSession({
         "SpieloAutomat": _value_csv(0),
         "HeisserDraht":  _value_csv(21),
@@ -294,12 +335,12 @@ def test_query_username_returns_none_on_empty_or_error():
 
 
 # ---------------------------------------------------------------------------
-# write_endwert
+# write_spielstand / delete_spielstand
 # ---------------------------------------------------------------------------
-def test_write_endwert_uses_unified_schema():
+def test_write_spielstand_live_only_after_each_hand():
     sess = _FakeSession()
     with _test_env(sess):
-        assert influx_db.write_endwert(UID, 1) is True
+        assert influx_db.write_spielstand(UID, live=69) is True
     call = sess.calls[0]
     assert call["url"] == "http://example.local/api/v2/write"
     assert call["params"] == {
@@ -308,15 +349,38 @@ def test_write_endwert_uses_unified_schema():
     assert call["headers"]["Authorization"] == "Token tw"
     # Ohne Zeitstempel - InfluxDB setzt die Serverzeit (Pi-Uhr geht falsch).
     assert call["body"].strip().splitlines() == [
-        f"durchlauf,userid={UID} endscore=1i",
+        f"durchlauf,userid={UID} live=69i",
     ]
 
 
-def test_delete_endwert_targets_only_this_player_in_spieloautomat():
+def test_write_spielstand_live_and_luck_in_one_point():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_spielstand(UID, live=69, glueck=50) is True
+    assert sess.calls[0]["body"].strip().splitlines() == [
+        f"durchlauf,userid={UID} live=69i,endscore=50i",
+    ]
+
+
+def test_write_spielstand_luck_only():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_spielstand(UID, glueck=67) is True
+    assert sess.calls[0]["body"].strip() == f"durchlauf,userid={UID} endscore=67i"
+
+
+def test_write_spielstand_nothing_to_write():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_spielstand(UID) is True
+    assert sess.calls == []
+
+
+def test_delete_spielstand_targets_only_this_player_in_spieloautomat():
     import json
     sess = _FakeSession()
     with _test_env(sess):
-        assert influx_db.delete_endwert(UID) is True
+        assert influx_db.delete_spielstand(UID) is True
     call = sess.calls[0]
     assert call["url"] == "http://example.local/api/v2/delete"
     assert call["params"] == {"org": "o", "bucket": "SpieloAutomat"}
@@ -341,25 +405,25 @@ def test_list_schema_shows_measurement_field_and_tags():
         ]
 
 
-def test_write_endwert_returns_false_when_not_configured():
+def test_write_spielstand_returns_false_when_not_configured():
     old = influx_db.INFLUX_TOKEN_WRITE
     influx_db.INFLUX_TOKEN_WRITE = ""
     try:
-        assert influx_db.write_endwert("uid", 10) is False
+        assert influx_db.write_spielstand("uid", live=10) is False
     finally:
         influx_db.INFLUX_TOKEN_WRITE = old
 
 
-def test_write_endwert_returns_false_on_http_error():
+def test_write_spielstand_returns_false_on_http_error():
     with _test_env(_FakeSession(writes_ok=False)):
-        assert influx_db.write_endwert("uid", 10) is False
+        assert influx_db.write_spielstand("uid", live=10) is False
 
 
 # ---------------------------------------------------------------------------
 # Low-Level
 # ---------------------------------------------------------------------------
 def test_first_value_handles_annotations_and_empty():
-    assert influx_db._first_value(ENDWERT_CSV) == "125"
+    assert influx_db._first_value(LIVE_CSV) == "125"
     assert influx_db._first_value(USERNAME_CSV) == "Tobias"
     assert influx_db._first_value("") is None
     assert influx_db._first_value(EMPTY_CSV) is None
@@ -367,7 +431,7 @@ def test_first_value_handles_annotations_and_empty():
 
 def test_rows_handles_tables_with_own_headers():
     """Tabellen mit unterschiedlichem Schema kommen als eigene Blöcke."""
-    text = ENDWERT_CSV + "\r\n" + USERNAME_CSV
+    text = LIVE_CSV + "\r\n" + USERNAME_CSV
     rows = list(influx_db._rows(text))
     assert [r["_measurement"] for r in rows] == ["durchlauf", "PPMaster"]
     assert [r["_value"] for r in rows] == ["125", "Tobias"]

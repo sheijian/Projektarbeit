@@ -123,6 +123,18 @@ class Game:
             self.message = f"Willkommen {player.name}! Einsatz: {self.current_bet}"
 
     @property
+    def luck_percent(self) -> Optional[int]:
+        """Glückswert dieses Durchlaufs: gewonnene / gespielte Hände in %,
+        kaufmännisch gerundet (2 von 3 -> 67). Gewonnen = Runde mit Plus,
+        Unentschieden zählt nicht. ``None``, solange nichts gespielt ist."""
+        if self.session_plays == 0:
+            return None
+        # Ganzzahlig "halb aufrunden" - vermeidet Pythons Banker's Rounding.
+        return (self.session_wins * 200 + self.session_plays) // (
+            2 * self.session_plays
+        )
+
+    @property
     def can_logout(self) -> bool:
         """Logout nur zwischen den Runden - nicht mitten in einer Hand,
         sonst wäre der Einsatz schon abgezogen."""

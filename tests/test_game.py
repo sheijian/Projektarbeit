@@ -216,3 +216,33 @@ def test_can_logout_with_too_low_balance():
     game = Game(min_bet=10)
     game.login(Player("uid", "T", 1), default_bet=10)
     assert game.can_logout
+
+
+def test_luck_percent_is_won_hands_over_played_hands():
+    game = Game()
+    game.login(Player("uid", "T", 100), default_bet=10)
+    assert game.luck_percent is None             # noch nichts gespielt
+    for plays, wins, want in [
+        (10, 5, 50), (3, 2, 67), (3, 1, 33), (8, 1, 13),
+        (4, 0, 0), (7, 7, 100),
+    ]:
+        game.session_plays, game.session_wins = plays, wins
+        assert game.luck_percent == want, (plays, wins)
+
+
+def test_luck_percent_counts_real_rounds():
+    """Eine gewonnene und eine verlorene Runde -> 50 %."""
+    game = Game()
+    game.deck = StackedDeck([
+        # Runde 1: Spieler K+9 (19) vs. Dealer 6+10, Dealer zieht Q -> WIN
+        C("K"), C("6"), C("9"), C("10"), C("Q"),
+        # Runde 2: Spieler 10+6 (16) vs. Dealer 10+9 (19) -> LOSE
+        C("10"), C("10"), C("6"), C("9"),
+    ])
+    game.login(Player("uid", "T", 100), default_bet=10)
+    game.start_round(); game.stand()
+    game.start_round(); game.stand()
+    assert (game.session_plays, game.session_wins) == (2, 1)
+    assert game.luck_percent == 50
+    game.logout()
+    assert game.luck_percent is None             # neuer Durchlauf

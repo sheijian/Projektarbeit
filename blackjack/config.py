@@ -21,7 +21,7 @@ K_ACTIONS: Dict[str, str] = {
     "K2": "stand",
     "K3": "double",
     "K4": "split",
-    "K5": "logout",     # Endwert speichern + RFID-User abmelden
+    "K5": "logout",     # Durchlauf speichern + RFID-User abmelden
 }
 
 

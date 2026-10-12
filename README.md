@@ -8,10 +8,10 @@ Blackjack-Automat mit:
   `H` / `S` / `D` / `P` / `L`
 - **RFID-Reader hinter einem ESP32** als HTTP-Statusseite
   (Default: `http://10.0.244.81/status`)
-- **InfluxDB** – beim Chip-Auflegen wird der letzte Blackjack-Endwert aus
-  `SpieloAutomat` geladen bzw. beim ersten Spiel die Summe der sechs
-  Stationen als Startguthaben; nach jeder Hand und beim Logout wird der
-  neue Endwert gespeichert
+- **InfluxDB** – beim Chip-Auflegen wird der letzte Kontostand (`live`)
+  aus `SpieloAutomat` geladen bzw. beim ersten Spiel die Summe der sechs
+  Stationen als Startguthaben; nach jeder Hand wird `live` gespeichert,
+  am Ende jedes Durchlaufs zusätzlich der Glückswert (`endscore`)
 - **Logout** per Taster K5, Taste `L` oder LOGOUT-Button auf dem
   Bildschirm (Maus/Touch)
 
@@ -104,7 +104,8 @@ Alle Buckets nutzen dasselbe Schema:
 | Wurfgenauigkeit   | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
 | Whackamole        | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
 | Gedaechtnistest   | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
-| **SpieloAutomat** | `durchlauf` | `endscore` | `userid`   | **Blackjack-Endwert**       |
+| **SpieloAutomat** | `durchlauf` | `live`     | `userid`   | **Kontostand** (nach jeder Hand) |
+| **SpieloAutomat** | `durchlauf` | `endscore` | `userid`   | **Glückswert in %** (pro Durchlauf) |
 
 Bucket-Namen und Schema stehen oben in `blackjack/influx_db.py`
 (`STATION_BUCKETS`, `MEASUREMENT`, `FIELD`, `TAG`).
@@ -117,21 +118,38 @@ der DB steht, zeigt `python -m scripts.punkte --schema`.
 
 **Beim Chip-Auflegen** (`query_balance`):
 
-1. Gibt es in `SpieloAutomat` schon einen Endwert für die `userid`?
-   → Spieler startet genau dort (Blackjack-Endwert).
+1. Gibt es in `SpieloAutomat` schon einen Kontostand (`live`) für die
+   `userid`? → Spieler startet genau dort. (`endscore` = Glückswert wird
+   dafür **nie** benutzt.)
 2. Sonst: Summe aller Durchläufe aus den sechs Stations-Buckets
    → Startguthaben. Ein noch nicht angelegter Bucket zählt als 0.
 3. Gar keine Daten → `--starting-balance`.
 
 Antwortet die Datenbank nicht, wird **kein** Ersatzwert genommen (sonst
-würde der echte Endwert nach der ersten Hand überschrieben) – das Spiel
+würde der echte Kontostand nach der ersten Hand überschrieben) – das Spiel
 zeigt „Datenbank nicht erreichbar“ und versucht es alle 5 s erneut.
 
-**Gespeichert** wird der Endwert (`write_endwert`) nach jeder Hand und
-beim Logout als `durchlauf,userid=<id> endscore=<wert>` in
-`SpieloAutomat`. Nur Blackjack schreibt dorthin. Wer sich abmeldet,
-ohne eine Hand gespielt zu haben, bekommt **keinen** Endwert – sonst
-würde ein (evtl. falsches) Startguthaben festgeschrieben.
+**Gespeichert** wird in `SpieloAutomat` (`write_spielstand`), nur
+Blackjack schreibt dorthin:
+
+| Wann                                   | Datenpunkt                                         |
+|----------------------------------------|----------------------------------------------------|
+| nach jeder Hand                        | `durchlauf,userid=<id> live=<kontostand>`          |
+| Ende des Durchlaufs (s. u.)            | `durchlauf,userid=<id> live=<kontostand>,endscore=<glück>` |
+
+**Glückswert** (`endscore`) = gewonnene Hände ÷ gespielte Hände × 100,
+kaufmännisch gerundet, als Ganzzahl – z. B. 5 von 10 → `50`,
+2 von 3 → `67`. Gezählt wird pro **Durchlauf** (Login bis Logout).
+Gewonnen = Runde mit Plus; Unentschieden zählt nicht als gewonnen, eine
+Runde mit Split zählt als eine Hand.
+
+Ein Durchlauf endet – und der Glückswert wird **einmal** gespeichert –
+beim Logout, wenn der ESP32 den Spieler abmeldet, wenn ein anderer Chip
+aufgelegt wird oder wenn das Programm beendet wird. Wer keine Hand
+gespielt hat, bekommt nichts gespeichert (sonst würde ein evtl. falsches
+Startguthaben festgeschrieben). Endet der Durchlauf mitten in einer
+Hand, wird nur der Glückswert geschrieben; `live` bleibt auf dem Stand
+der letzten fertigen Hand.
 
 Beim Schreiben wird **kein Zeitstempel** mitgeschickt – InfluxDB setzt
 die Serverzeit. Die Uhr des Pi geht ohne Internet/NTP falsch;
@@ -141,19 +159,20 @@ Explorer mit „Past 1h“ unsichtbar.
 **Prüfen und zurücksetzen** (auf dem Pi, im Projektordner):
 
 ```bash
-python -m scripts.punkte <userid>                  # Punkte je Station, Startguthaben, Endwert
-python -m scripts.punkte --schema                  # was wirklich in jedem Bucket steht
-python -m scripts.punkte <userid> --reset-endwert  # Endwert löschen -> wieder Startguthaben
+python -m scripts.punkte <userid>            # Punkte je Station, Startguthaben, live, Glückswert
+python -m scripts.punkte --schema            # was wirklich in jedem Bucket steht
+python -m scripts.punkte <userid> --reset    # live + endscore löschen -> wieder Startguthaben
 ```
 
 ### Logout (Taster K5, Taste `L` oder LOGOUT antippen)
 
 Zwischen zwei Runden meldet Logout den Spieler ab:
 
-1. Kontostand als Endwert nach `SpieloAutomat` schreiben,
+1. Durchlauf speichern: Kontostand (`live`) + Glückswert (`endscore`)
+   nach `SpieloAutomat` (nur wenn gespielt wurde),
 2. RFID-User am ESP32 abmelden: `GET http://10.0.244.81/logout`
    (abgeleitet aus `--rfid-url`, überschreibbar mit `--logout-url`),
-3. Spieler im Spiel abmelden – „Tschüss …! Endwert: …“.
+3. Spieler im Spiel abmelden – „Tschüss …! Guthaben: … Glück: … %“.
 
 Schlägt Schritt 1 oder 2 fehl, bleibt der Spieler angemeldet und kann
 nochmal drücken. Mitten in einer Hand ist Logout gesperrt. Alle Buttons

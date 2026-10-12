@@ -18,9 +18,13 @@ Beispiele:
     # Live-Reader-Test mit beliebigem Startguthaben
     python main.py --starting-balance 500
 
+SpieloAutomat (measurement durchlauf, Tag userid):
+    live      Kontostand - nach jeder Hand
+    endscore  Glückswert (gewonnene / gespielte Hände in %) - am Ende
+              jedes Durchlaufs (Logout, Chip-Wechsel, RFID-Abmeldung, Ende)
+
 Logout (Taster K5, Taste L oder LOGOUT auf dem Bildschirm antippen):
-speichert den Endwert in SpieloAutomat (durchlauf/endscore/userid) und
-meldet den RFID-User am ESP32 ab (.../logout).
+speichert Kontostand + Glückswert und meldet den RFID-User am ESP32 ab.
 """
 
 from __future__ import annotations
@@ -111,11 +115,13 @@ class App:
         if influx_db.INFLUX_TOKEN_READ:
             log.info(
                 "InfluxDB: %s (org=%s) - Schema %s/%s/%s, Startguthaben = "
-                "Summe aus %s, Endwert nach %s, Username aus %s",
+                "Summe aus %s, Spielstand nach %s (Fields %s + %s), "
+                "Username aus %s",
                 influx_db.INFLUX_URL, influx_db.INFLUX_ORG,
                 influx_db.MEASUREMENT, influx_db.FIELD, influx_db.TAG,
                 ", ".join(influx_db.STATION_BUCKETS),
-                influx_db.SCORE_BUCKET, influx_db.USERNAME_BUCKET,
+                influx_db.SCORE_BUCKET, influx_db.FIELD_LIVE,
+                influx_db.FIELD_GLUECK, influx_db.USERNAME_BUCKET,
             )
         else:
             log.warning(
@@ -134,6 +140,9 @@ class App:
 
         # (uid, Zeitpunkt) für einen Login, der wegen DB-Fehler wiederholt wird.
         self._login_retry: Optional[tuple[str, float]] = None
+        # session_plays beim letzten Glückswert-Write - verhindert, dass ein
+        # Durchlauf doppelt gespeichert wird (z. B. Logout zweimal gedrückt).
+        self._glueck_saved_plays = 0
 
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
@@ -187,9 +196,8 @@ class App:
                 return
             if uid is None:
                 log.info("RFID abgemeldet")
-                # Der Endwert steht bereits in SpieloAutomat
-                # (nach jeder Runde über _on_round_end geschrieben).
                 self._login_retry = None
+                self._finish_session()
                 self.game.logout()
             else:
                 self._login_by_uid(uid)
@@ -197,13 +205,16 @@ class App:
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
         self._login_retry = None
+        # Anderer Chip, während noch jemand spielt -> dessen Durchlauf beenden.
+        if self.game.player is not None and self.game.player.rfid != uid:
+            self._finish_session()
 
-        # 1) Kontostand: Blackjack-Endwert aus SpieloAutomat, falls der
-        #    Spieler schon gespielt hat - sonst Summe der sechs Stationen.
+        # 1) Kontostand: letzter Kontostand (live) aus SpieloAutomat, falls
+        #    der Spieler schon gespielt hat - sonst Summe der sechs Stationen.
         try:
             score = influx_db.query_balance(uid)
         except influx_db.DBError as e:
-            # Kein Ersatzwert - sonst würde der echte Endwert nach der
+            # Kein Ersatzwert - sonst würde der echte Kontostand nach der
             # ersten Hand überschrieben. Später nochmal versuchen.
             log.warning("Login %s: Datenbank-Fehler (%s) - neuer Versuch "
                         "in %.0f s", uid, e, LOGIN_RETRY_SECONDS)
@@ -213,7 +224,7 @@ class App:
             return
         if score is None:
             log.warning(
-                "Keine Punkte für userid=%s (weder Endwert noch Stationen) "
+                "Keine Punkte für userid=%s (weder live noch Stationen) "
                 "- nehme Fallback %d",
                 uid, self.args.starting_balance,
             )
@@ -234,6 +245,7 @@ class App:
             "Login: userid=%s | name=%s | balance=%d",
             player.rfid, player.name, player.balance,
         )
+        self._glueck_saved_plays = 0
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _retry_login_if_due(self) -> None:
@@ -253,34 +265,56 @@ class App:
             log.warning("Auto-Login: Spieler '%s' unbekannt", name)
             return
         log.info("Auto-Login: %s (Guthaben %d)", player.name, player.balance)
+        self._glueck_saved_plays = 0
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
-        """Nach jeder Hand den Endwert zwischenspeichern - falls jemand
+        """Nach jeder Hand den Kontostand (live) speichern - falls jemand
         geht, ohne den Logout-Taster zu drücken."""
-        self._save_endwert(player)
+        self._save(player, live=player.balance)
 
-    def _save_endwert(self, player: Player) -> bool:
-        """Schreibt den Kontostand als Blackjack-Endwert nach SpieloAutomat
-        (durchlauf/endscore, Tag userid).
+    def _finish_session(self) -> bool:
+        """Durchlauf beenden: Glückswert (endscore) speichern, zwischen den
+        Runden auch den Kontostand. Nur wenn in diesem Durchlauf gespielt
+        wurde und er noch nicht gespeichert ist."""
+        player = self.game.player
+        plays = self.game.session_plays
+        if player is None or plays == 0 or plays == self._glueck_saved_plays:
+            return True
+        # Mitten in einer Hand ist der Einsatz schon abgezogen - dann den
+        # Kontostand nicht anfassen (live steht seit der letzten Hand).
+        live = player.balance if self.game.can_logout else None
+        if not self._save(player, live=live, glueck=self.game.luck_percent):
+            return False
+        self._glueck_saved_plays = plays
+        return True
+
+    def _save(
+        self,
+        player: Player,
+        live: Optional[int] = None,
+        glueck: Optional[int] = None,
+    ) -> bool:
+        """Schreibt Kontostand und/oder Glückswert nach SpieloAutomat.
 
         Ohne Schreib-Token (Offline-Test) gibt es nichts zu speichern -
         dann ``True``, damit der Logout trotzdem funktioniert.
         """
         if not influx_db.INFLUX_TOKEN_WRITE:
-            log.warning("Endwert %d nicht gespeichert: INFLUX_TOKEN_WRITE "
-                        "fehlt in blackjack/influx_db.py", player.balance)
+            log.warning("Nicht gespeichert (live=%s, endscore=%s): "
+                        "INFLUX_TOKEN_WRITE fehlt in blackjack/influx_db.py",
+                        live, glueck)
             return True
         try:
-            return influx_db.write_endwert(player.rfid, player.balance)
+            return influx_db.write_spielstand(player.rfid, live=live, glueck=glueck)
         except Exception as e:
-            log.warning("write_endwert fehlgeschlagen: %s", e)
+            log.warning("write_spielstand fehlgeschlagen: %s", e)
             return False
 
     def _logout(self) -> None:
-        """Logout-Taster: Endwert speichern, dann RFID-User am ESP32
-        abmelden. Schlägt ein Schritt fehl, bleibt der Spieler angemeldet
-        und kann es nochmal versuchen."""
+        """Logout-Taster: Durchlauf speichern (Kontostand + Glückswert),
+        dann RFID-User am ESP32 abmelden. Schlägt ein Schritt fehl, bleibt
+        der Spieler angemeldet und kann es nochmal versuchen."""
         player = self.game.player
         if player is None:
             self.game.message = "Kein Spieler angemeldet"
@@ -289,21 +323,24 @@ class App:
             self.game.message = "Erst die Runde zu Ende spielen"
             return
         # Nur speichern, wenn wirklich gespielt wurde - sonst würde z. B. ein
-        # (falsches) Startguthaben als Endwert festgeschrieben und hätte ab
-        # dann Vorrang vor allen Stationspunkten.
-        if self.game.session_plays > 0 and not self._save_endwert(player):
+        # (falsches) Startguthaben als Kontostand festgeschrieben und hätte
+        # ab dann Vorrang vor allen Stationspunkten.
+        if not self._finish_session():
             self.game.message = "Speichern fehlgeschlagen - nochmal Logout"
             return
         if self.rfid is not None and not self.rfid.logout():
             self.game.message = "RFID-Logout fehlgeschlagen - nochmal Logout"
             return
-        log.info("Logout: userid=%s | name=%s | %d Hände | Endwert=%d%s",
+        glueck = self.game.luck_percent
+        log.info("Logout: userid=%s | name=%s | %d Hände, %d gewonnen | "
+                 "live=%d | endscore=%s",
                  player.rfid, player.name, self.game.session_plays,
-                 player.balance,
-                 " gespeichert" if self.game.session_plays else
-                 " (nicht gespielt - nichts gespeichert)")
+                 self.game.session_wins, player.balance,
+                 "-" if glueck is None else f"{glueck} %")
         self.game.logout()
-        self.game.message = f"Tschüss {player.name}! Endwert: {player.balance}"
+        self.game.message = f"Tschüss {player.name}! Guthaben: {player.balance}"
+        if glueck is not None:
+            self.game.message += f"  Glück: {glueck} %"
 
     # ------------------------------------------------------------------
     # Taster
@@ -337,8 +374,11 @@ class App:
 
     # ------------------------------------------------------------------
     def _shutdown(self) -> None:
-        # Der Endwert steht bereits nach der letzten Runde in
-        # SpieloAutomat - hier ist nichts weiter zu persistieren.
+        # Laufenden Durchlauf abschließen (Glückswert speichern).
+        try:
+            self._finish_session()
+        except Exception:  # pragma: no cover
+            pass
         try:
             self.buttons.close()
         except Exception:  # pragma: no cover

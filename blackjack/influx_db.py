@@ -4,15 +4,20 @@ Alle Spielstationen speichern einheitlich:
 
     Bucket <Station>  measurement "durchlauf"  field "endscore"  tag "userid"
 
-Unser eigener Bucket ``SpieloAutomat`` hat dasselbe Schema - dort steht
-der Blackjack-Endwert, zuordenbar über die ``userid``.
+Unser eigener Bucket ``SpieloAutomat`` (measurement "durchlauf", tag
+"userid") hat zwei Fields:
+
+    live      aktueller Kontostand - nach jeder Hand
+    endscore  Glückswert = gewonnene Hände / gespielte Hände in %
+              - einmal pro Durchlauf (Login bis Logout)
 
     query_balance(userid)        -> int | None   Kontostand für den Login
-    query_endwert(userid)        -> int | None   Blackjack-Endwert (SpieloAutomat)
+    query_live(userid)           -> int | None   letzter Kontostand (live)
+    query_glueck(userid)         -> int | None   letzter Glückswert (endscore)
     query_station_points(userid) -> {bucket: punkte}  (die sechs Stationen)
     query_username(userid)       -> str | None   Anzeigename (PPMaster)
-    write_endwert(userid, wert)  -> bool         Endwert nach SpieloAutomat
-    delete_endwert(userid)       -> bool         Endwert löschen (Testspieler)
+    write_spielstand(userid, live, glueck) -> bool  nach SpieloAutomat
+    delete_spielstand(userid)    -> bool         live + endscore löschen
     list_schema(bucket)          -> [(measurement, field, tags)]  Diagnose
 
 Zugangsdaten (URL, Org, Tokens) stehen oben als Konstanten. Trage die
@@ -75,8 +80,10 @@ STATION_BUCKETS = (
     "Gedaechtnistest",
 )
 
-# Unser Bucket: hier steht der Blackjack-Endwert. Schreibt NUR Blackjack.
+# Unser Bucket - schreibt NUR Blackjack (measurement/tag wie oben).
 SCORE_BUCKET = "SpieloAutomat"
+FIELD_LIVE   = "live"        # Kontostand, daraus startet der nächste Login
+FIELD_GLUECK = FIELD         # "endscore" = Glückswert in % (0..100)
 
 # PPMaster speichert pro RFID-Chip den Anzeigenamen (gefüllt vom ESP32).
 USERNAME_BUCKET      = "PPMaster"
@@ -121,22 +128,23 @@ def _is_configured() -> bool:
 def query_balance(userid: str) -> Optional[int]:
     """Kontostand für den Login.
 
-    Hat der Spieler schon Blackjack gespielt, ist das sein Endwert aus
-    SpieloAutomat - sonst die Summe seiner Punkte aus den sechs Stationen
-    (Startguthaben). ``None``, wenn es nirgends Daten gibt.
+    Hat der Spieler schon Blackjack gespielt, ist das sein letzter
+    Kontostand (``live``) aus SpieloAutomat - sonst die Summe seiner
+    Punkte aus den sechs Stationen (Startguthaben). ``None``, wenn es
+    nirgends Daten gibt.
 
     Wirft ``DBError``, wenn die DB nicht antwortet - dann darf auf keinen
-    Fall ein Ersatzwert genommen werden, sonst würde der echte Endwert
+    Fall ein Ersatzwert genommen werden, sonst würde der echte Kontostand
     nach der ersten Hand überschrieben.
     """
     if not _is_configured():
         log.warning("query_balance: InfluxDB nicht konfiguriert")
         return None
-    endwert = query_endwert(userid)
-    if endwert is not None:
-        log.info("query_balance: userid=%s -> %d (Blackjack-Endwert)",
-                 userid, endwert)
-        return endwert
+    live = query_live(userid)
+    if live is not None:
+        log.info("query_balance: userid=%s -> %d (letzter Kontostand, live)",
+                 userid, live)
+        return live
     points = query_station_points(userid)
     if not points:
         log.info("query_balance: keine Punkte für userid=%s", userid)
@@ -147,13 +155,22 @@ def query_balance(userid: str) -> Optional[int]:
     return total
 
 
-def query_endwert(userid: str) -> Optional[int]:
-    """Letzter Blackjack-Endwert aus SpieloAutomat. Wirft ``DBError``."""
+def query_live(userid: str) -> Optional[int]:
+    """Letzter Kontostand (``live``) aus SpieloAutomat. Wirft ``DBError``."""
+    return _query_last(userid, FIELD_LIVE)
+
+
+def query_glueck(userid: str) -> Optional[int]:
+    """Letzter Glückswert (``endscore``) aus SpieloAutomat. Wirft ``DBError``."""
+    return _query_last(userid, FIELD_GLUECK)
+
+
+def _query_last(userid: str, field: str) -> Optional[int]:
     flux = (
         f'from(bucket: "{SCORE_BUCKET}")\n'
         f'  |> range(start: 0)\n'
         f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
-        f'r._field == "{FIELD}")\n'
+        f'r._field == "{field}")\n'
         f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(userid)}")\n'
         f'  |> last()\n'
     )
@@ -218,16 +235,30 @@ def query_username(userid: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Schreiben
 # ---------------------------------------------------------------------------
-def write_endwert(userid: str, endwert: int) -> bool:
-    """Schreibt den Blackjack-Endwert nach SpieloAutomat
-    (``durchlauf,userid=<id> endscore=<wert>``)."""
+def write_spielstand(
+    userid: str,
+    live: Optional[int] = None,
+    glueck: Optional[int] = None,
+) -> bool:
+    """Schreibt Kontostand (``live``) und/oder Glückswert (``endscore``)
+    in einen Datenpunkt nach SpieloAutomat::
+
+        durchlauf,userid=<id> live=<kontostand>i,endscore=<glueck>i
+    """
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
-        log.warning("write_endwert: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
+        log.warning("write_spielstand: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
         return False
+    fields = []
+    if live is not None:
+        fields.append(f"{FIELD_LIVE}={int(live)}i")
+    if glueck is not None:
+        fields.append(f"{FIELD_GLUECK}={int(glueck)}i")
+    if not fields:
+        return True
 
     # Ohne Zeitstempel - InfluxDB setzt die Serverzeit.
-    line = f"{MEASUREMENT},{TAG}={_esc_tag(userid)} {FIELD}={int(endwert)}i\n"
-    log.debug("write_endwert -> %s/api/v2/write LINE: %s",
+    line = f"{MEASUREMENT},{TAG}={_esc_tag(userid)} {','.join(fields)}\n"
+    log.debug("write_spielstand -> %s/api/v2/write LINE: %s",
               INFLUX_URL, line.strip())
 
     try:
@@ -242,22 +273,22 @@ def write_endwert(userid: str, endwert: int) -> bool:
             timeout=5,
         )
     except requests.RequestException as e:
-        log.warning("write_endwert: Netzwerkfehler %s", e)
+        log.warning("write_spielstand: Netzwerkfehler %s", e)
         return False
     if not r.ok:
-        log.warning("write_endwert HTTP %s: %s | LINE: %s",
+        log.warning("write_spielstand HTTP %s: %s | LINE: %s",
                     r.status_code, r.text[:200], line.strip())
         return False
-    log.info("write_endwert OK: %s/%s userid=%s endscore=%d",
-             SCORE_BUCKET, MEASUREMENT, userid, endwert)
+    log.info("write_spielstand OK: %s %s", SCORE_BUCKET, line.strip())
     return True
 
 
-def delete_endwert(userid: str) -> bool:
-    """Löscht alle Blackjack-Endwerte eines Spielers in SpieloAutomat -
-    danach startet er wieder mit dem Startguthaben (für Testspieler)."""
+def delete_spielstand(userid: str) -> bool:
+    """Löscht Kontostand (live) und Glückswerte (endscore) eines Spielers
+    in SpieloAutomat - danach startet er wieder mit dem Startguthaben
+    (für Testspieler)."""
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
-        log.warning("delete_endwert: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
+        log.warning("delete_spielstand: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
         return False
     body = {
         "start": "1970-01-01T00:00:00Z",
@@ -277,12 +308,12 @@ def delete_endwert(userid: str) -> bool:
             timeout=10,
         )
     except requests.RequestException as e:
-        log.warning("delete_endwert: Netzwerkfehler %s", e)
+        log.warning("delete_spielstand: Netzwerkfehler %s", e)
         return False
     if not r.ok:
-        log.warning("delete_endwert HTTP %s: %s", r.status_code, r.text[:200])
+        log.warning("delete_spielstand HTTP %s: %s", r.status_code, r.text[:200])
         return False
-    log.info("delete_endwert OK: %s userid=%s", SCORE_BUCKET, userid)
+    log.info("delete_spielstand OK: %s userid=%s", SCORE_BUCKET, userid)
     return True
 
 
