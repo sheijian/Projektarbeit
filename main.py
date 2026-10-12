@@ -18,8 +18,9 @@ Beispiele:
     # Live-Reader-Test mit beliebigem Startguthaben
     python main.py --starting-balance 500
 
-Logout-Taster (K5 bzw. Taste L): speichert den Endwert in SpieloAutomat
-(blackjack/endwert) und meldet den RFID-User am ESP32 ab (.../logout).
+Logout (Taster K5, Taste L oder LOGOUT auf dem Bildschirm antippen):
+speichert den Endwert in SpieloAutomat (durchlauf/endscore/userid) und
+meldet den RFID-User am ESP32 ab (.../logout).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from typing import Optional
 
 import pygame
@@ -41,6 +43,9 @@ from blackjack.store import LocalPlayerStore
 
 
 log = logging.getLogger("blackjack")
+
+# Wartezeit, bevor ein Login nach DB-Fehler automatisch wiederholt wird.
+LOGIN_RETRY_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -105,14 +110,12 @@ class App:
         # Zeige klar an, ob die InfluxDB-Verbindung bereit ist.
         if influx_db.INFLUX_TOKEN_READ:
             log.info(
-                "InfluxDB: %s (org=%s) - Startguthaben aus %s/%s/%s, "
-                "Endwert nach %s/%s/%s, Username aus %s",
+                "InfluxDB: %s (org=%s) - Schema %s/%s/%s, Startguthaben = "
+                "Summe aus %s, Endwert nach %s, Username aus %s",
                 influx_db.INFLUX_URL, influx_db.INFLUX_ORG,
-                influx_db.SCORE_BUCKET, influx_db.SCORE_MEASUREMENT,
-                influx_db.SCORE_FIELD,
-                influx_db.SCORE_BUCKET, influx_db.ENDWERT_MEASUREMENT,
-                influx_db.ENDWERT_FIELD,
-                influx_db.USERNAME_BUCKET,
+                influx_db.MEASUREMENT, influx_db.FIELD, influx_db.TAG,
+                ", ".join(influx_db.STATION_BUCKETS),
+                influx_db.SCORE_BUCKET, influx_db.USERNAME_BUCKET,
             )
         else:
             log.warning(
@@ -128,6 +131,9 @@ class App:
         )
         self.gui = BlackjackGUI(self.game)
         self.buttons = ButtonHandler(mode=args.input)
+
+        # (uid, Zeitpunkt) für einen Login, der wegen DB-Fehler wiederholt wird.
+        self._login_retry: Optional[tuple[str, float]] = None
 
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
@@ -146,12 +152,18 @@ class App:
                     running = False
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    # Bildschirm-Buttons per Maus/Touch (z. B. LOGOUT).
+                    action = self.gui.action_at(event.pos)
+                    if action is not None:
+                        self._dispatch(action)
                 else:
                     self.gui.handle_pygame_event(event)
                     self.buttons.handle_pygame_event(event)
 
             if self.rfid is not None:
                 self._process_rfid()
+            self._retry_login_if_due()
             self._process_buttons()
             self.gui.tick()
 
@@ -177,20 +189,32 @@ class App:
                 log.info("RFID abgemeldet")
                 # Der Endwert steht bereits in SpieloAutomat
                 # (nach jeder Runde über _on_round_end geschrieben).
+                self._login_retry = None
                 self.game.logout()
             else:
                 self._login_by_uid(uid)
 
     def _login_by_uid(self, uid: str) -> None:
         log.info("RFID gelesen: %s", uid)
+        self._login_retry = None
 
-        # 1) Kontostand aus SpieloAutomat: Blackjack-Endwert, falls der
-        #    Spieler schon gespielt hat - sonst Startguthaben (Aggregator).
-        score = influx_db.query_balance(uid)
+        # 1) Kontostand: Blackjack-Endwert aus SpieloAutomat, falls der
+        #    Spieler schon gespielt hat - sonst Summe der sechs Stationen.
+        try:
+            score = influx_db.query_balance(uid)
+        except influx_db.DBError as e:
+            # Kein Ersatzwert - sonst würde der echte Endwert nach der
+            # ersten Hand überschrieben. Später nochmal versuchen.
+            log.warning("Login %s: Datenbank-Fehler (%s) - neuer Versuch "
+                        "in %.0f s", uid, e, LOGIN_RETRY_SECONDS)
+            self.game.logout()
+            self.game.message = "Datenbank nicht erreichbar - neuer Versuch ..."
+            self._login_retry = (uid, time.monotonic() + LOGIN_RETRY_SECONDS)
+            return
         if score is None:
             log.warning(
-                "SpieloAutomat hat weder Endwert noch Startguthaben für "
-                "user_id=%s - nehme Fallback %d",
+                "Keine Punkte für userid=%s (weder Endwert noch Stationen) "
+                "- nehme Fallback %d",
                 uid, self.args.starting_balance,
             )
         else:
@@ -212,6 +236,13 @@ class App:
         )
         self.game.login(player, default_bet=self.args.default_bet)
 
+    def _retry_login_if_due(self) -> None:
+        if self._login_retry is None:
+            return
+        uid, due = self._login_retry
+        if time.monotonic() >= due:
+            self._login_by_uid(uid)
+
     def _auto_login(self, name: str) -> None:
         player = self.store.find_by_name(name)
         if player is None:
@@ -230,7 +261,8 @@ class App:
         self._save_endwert(player)
 
     def _save_endwert(self, player: Player) -> bool:
-        """Schreibt den Kontostand als Blackjack-Endwert nach SpieloAutomat.
+        """Schreibt den Kontostand als Blackjack-Endwert nach SpieloAutomat
+        (durchlauf/endscore, Tag userid).
 
         Ohne Schreib-Token (Offline-Test) gibt es nichts zu speichern -
         dann ``True``, damit der Logout trotzdem funktioniert.
@@ -239,11 +271,8 @@ class App:
             log.warning("Endwert %d nicht gespeichert: INFLUX_TOKEN_WRITE "
                         "fehlt in blackjack/influx_db.py", player.balance)
             return True
-        # Username nur mitgeben, wenn er ein echter Name ist - der
-        # Fallback-Name == UUID soll NICHT ins username-Field.
-        name = player.name if player.name and player.name != player.rfid else None
         try:
-            return influx_db.write_endwert(player.rfid, player.balance, username=name)
+            return influx_db.write_endwert(player.rfid, player.balance)
         except Exception as e:
             log.warning("write_endwert fehlgeschlagen: %s", e)
             return False

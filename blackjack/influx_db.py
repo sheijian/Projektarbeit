@@ -1,10 +1,17 @@
 """Alle InfluxDB-Zugriffe des Blackjack-Automaten.
 
-Drei Funktionen, mehr nicht:
+Alle Spielstationen speichern einheitlich:
 
-    query_balance(user_id)               -> int | None  (aus SpieloAutomat)
-    query_username(user_id)              -> str | None  (aus PPMaster)
-    write_endwert(user_id, wert, name)   -> bool        (nach SpieloAutomat)
+    Bucket <Station>  measurement "durchlauf"  field "endscore"  tag "userid"
+
+Unser eigener Bucket ``SpieloAutomat`` hat dasselbe Schema - dort steht
+der Blackjack-Endwert, zuordenbar über die ``userid``.
+
+    query_balance(userid)        -> int | None   Kontostand für den Login
+    query_endwert(userid)        -> int | None   Blackjack-Endwert (SpieloAutomat)
+    query_station_points(userid) -> {bucket: punkte}  (die sechs Stationen)
+    query_username(userid)       -> str | None   Anzeigename (PPMaster)
+    write_endwert(userid, wert)  -> bool         Endwert nach SpieloAutomat
 
 Zugangsdaten (URL, Org, Tokens) stehen oben als Konstanten. Trage die
 Tokens direkt in dieser Datei ein - die Datei ist der einzige Ort, an
@@ -41,37 +48,45 @@ INFLUX_TOKEN_WRITE = ""
 
 
 # ===========================================================================
-# Schema: Zuordnung Bucket + Measurement + Field + Tag
+# Schema
 # ===========================================================================
+# Einheitlich in allen Buckets (sechs Stationen + SpieloAutomat).
+MEASUREMENT = "durchlauf"
+FIELD       = "endscore"      # int
+TAG         = "userid"
+
+# Die sechs Spielstationen - ihre Summe ist das Startguthaben.
+STATION_BUCKETS = (
+    "HeisserDraht",
+    "Ampelsequenz",
+    "TimerStrike",
+    "Wurfgenauigkeit",
+    "Whackamole",
+    "Gedaechtnistest",
+)
+
+# Unser Bucket: hier steht der Blackjack-Endwert. Schreibt NUR Blackjack.
+SCORE_BUCKET = "SpieloAutomat"
+
 # PPMaster speichert pro RFID-Chip den Anzeigenamen (gefüllt vom ESP32).
 USERNAME_BUCKET      = "PPMaster"
 USERNAME_MEASUREMENT = "PPMaster"
 USERNAME_FIELD       = "username"
 USERNAME_TAG         = "user_id"
 
-# SpieloAutomat ist unser Punkte-Bucket. Pro user_id liegen dort zwei
-# getrennte Werte, die sich gegenseitig nie überschreiben:
-#
-#   endscore/score     Startguthaben = Summe der sechs Stationen.
-#                      Schreibt NUR der Aggregator (alle 5 s).
-#   blackjack/endwert  Kontostand nach der letzten Blackjack-Hand.
-#                      Schreibt NUR Blackjack.
-#
-# Beim Login gilt: Endwert, falls vorhanden - sonst Startguthaben.
-SCORE_BUCKET      = "SpieloAutomat"
-SCORE_TAG         = "user_id"
-SCORE_MEASUREMENT = "endscore"    # Startguthaben (Aggregator)
-SCORE_FIELD       = "score"       # int
-
-ENDWERT_MEASUREMENT = "blackjack"   # Blackjack-Endwert
-ENDWERT_FIELD       = "endwert"     # int
-ENDWERT_NAME_FIELD  = "username"    # str (zusätzlich im selben Datenpunkt)
-
-# SERVER_TIME_NOTE: Wir schicken beim Schreiben KEINEN Zeitstempel mit -
-# InfluxDB setzt dann seine eigene Serverzeit. Die Uhr des Raspberry Pi
-# geht ohne Internet/NTP falsch (Datenpunkte landeten z. B. am 19.09.
-# statt heute) und tauchen dann im Data Explorer ("Past 1h") nicht auf.
+# Beim Schreiben schicken wir KEINEN Zeitstempel mit - InfluxDB setzt dann
+# seine Serverzeit. Die Uhr des Raspberry Pi geht ohne Internet/NTP falsch
+# (Datenpunkte landeten z. B. am 19.09. statt heute) und tauchen dann im
+# Data Explorer ("Past 1h") nicht auf.
 # ===========================================================================
+
+
+class DBError(Exception):
+    """InfluxDB nicht erreichbar oder Abfrage fehlgeschlagen."""
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 _session: Optional[requests.Session] = None
@@ -92,51 +107,72 @@ def _is_configured() -> bool:
 # Lesen
 # ---------------------------------------------------------------------------
 def query_balance(user_id: str) -> Optional[int]:
-    """Kontostand für den Login aus SpieloAutomat.
+    """Kontostand für den Login.
 
-    Hat der Spieler schon Blackjack gespielt, ist das sein Endwert -
-    sonst das Startguthaben vom Aggregator. Beides kommt aus EINER
-    Abfrage: Fällt sie aus, gibt es ``None`` und es kann nie passieren,
-    dass statt eines vorhandenen Endwerts das Startguthaben genommen wird.
+    Hat der Spieler schon Blackjack gespielt, ist das sein Endwert aus
+    SpieloAutomat - sonst die Summe seiner Punkte aus den sechs Stationen
+    (Startguthaben). ``None``, wenn es nirgends Daten gibt.
+
+    Wirft ``DBError``, wenn die DB nicht antwortet - dann darf auf keinen
+    Fall ein Ersatzwert genommen werden, sonst würde der echte Endwert
+    nach der ersten Hand überschrieben.
     """
     if not _is_configured():
         log.warning("query_balance: InfluxDB nicht konfiguriert")
         return None
+    endwert = query_endwert(user_id)
+    if endwert is not None:
+        log.info("query_balance: userid=%s -> %d (Blackjack-Endwert)",
+                 user_id, endwert)
+        return endwert
+    points = query_station_points(user_id)
+    if not points:
+        log.info("query_balance: keine Punkte für userid=%s", user_id)
+        return None
+    total = sum(points.values())
+    log.info("query_balance: userid=%s -> %d (Startguthaben aus %s)",
+             user_id, total, points)
+    return total
+
+
+def query_endwert(user_id: str) -> Optional[int]:
+    """Letzter Blackjack-Endwert aus SpieloAutomat. Wirft ``DBError``."""
     flux = (
         f'from(bucket: "{SCORE_BUCKET}")\n'
         f'  |> range(start: 0)\n'
-        f'  |> filter(fn: (r) => r.{SCORE_TAG} == "{_esc_q(user_id)}")\n'
-        f'  |> filter(fn: (r) =>\n'
-        f'       (r._measurement == "{ENDWERT_MEASUREMENT}" and '
-        f'r._field == "{ENDWERT_FIELD}") or\n'
-        f'       (r._measurement == "{SCORE_MEASUREMENT}" and '
-        f'r._field == "{SCORE_FIELD}"))\n'
+        f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
+        f'r._field == "{FIELD}")\n'
+        f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(user_id)}")\n'
         f'  |> last()\n'
     )
-    raw = _run_query(flux)
-    if raw is None:
-        return None
-    values = {
-        row.get("_measurement"): row.get("_value") for row in _rows(raw)
-    }
-    for measurement, label in (
-        (ENDWERT_MEASUREMENT, "Blackjack-Endwert"),
-        (SCORE_MEASUREMENT, "Startguthaben"),
-    ):
-        value = values.get(measurement)
-        if not value:
-            continue
+    return _to_int(_first_value(_run_query(flux)))
+
+
+def query_station_points(user_id: str) -> Dict[str, int]:
+    """Punkte pro Station (Summe aller Durchläufe). Stationen ohne Daten
+    fehlen im Ergebnis. Ein noch nicht angelegter Bucket zählt als 0,
+    jeder andere Fehler wirft ``DBError``."""
+    points: Dict[str, int] = {}
+    for bucket in STATION_BUCKETS:
+        flux = (
+            f'from(bucket: "{bucket}")\n'
+            f'  |> range(start: 0)\n'
+            f'  |> filter(fn: (r) => r._measurement == "{MEASUREMENT}" and '
+            f'r._field == "{FIELD}")\n'
+            f'  |> filter(fn: (r) => r.{TAG} == "{_esc_q(user_id)}")\n'
+            f'  |> group()\n'
+            f'  |> sum()\n'
+        )
         try:
-            balance = int(float(value))
-        except ValueError:
-            log.warning("query_balance: nicht-numerischer Wert %r", value)
-            return None
-        log.info("query_balance: user_id=%s -> %d (%s)",
-                 user_id, balance, label)
-        return balance
-    log.info("query_balance: kein Datenpunkt für user_id=%s in %s",
-             user_id, SCORE_BUCKET)
-    return None
+            value = _to_int(_first_value(_run_query(flux)))
+        except DBError as e:
+            if e.status == 404:
+                log.warning("Bucket %s nicht gefunden - zählt als 0", bucket)
+                continue
+            raise
+        if value is not None:
+            points[bucket] = value
+    return points
 
 
 def query_username(user_id: str) -> Optional[str]:
@@ -151,10 +187,10 @@ def query_username(user_id: str) -> Optional[str]:
         f'  |> filter(fn: (r) => r.{USERNAME_TAG} == "{_esc_q(user_id)}")\n'
         f'  |> last()\n'
     )
-    raw = _run_query(flux)
-    if raw is None:
+    try:
+        name = _first_value(_run_query(flux))
+    except DBError:
         return None
-    name = _first_value(raw)
     if name is None:
         log.info("query_username: kein Datenpunkt für user_id=%s in %s",
                  user_id, USERNAME_BUCKET)
@@ -166,29 +202,15 @@ def query_username(user_id: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Schreiben
 # ---------------------------------------------------------------------------
-def write_endwert(
-    user_id: str,
-    endwert: int,
-    username: Optional[str] = None,
-) -> bool:
-    """Schreibt den Blackjack-Endwert nach SpieloAutomat (blackjack/endwert).
-
-    Dieses Measurement schreibt nur Blackjack - der Aggregator fasst es
-    nie an. ``username`` ist optional; wenn gesetzt, kommt im selben
-    Datenpunkt ein zweites Field ``username`` dazu.
-    """
+def write_endwert(user_id: str, endwert: int) -> bool:
+    """Schreibt den Blackjack-Endwert nach SpieloAutomat
+    (``durchlauf,userid=<id> endscore=<wert>``)."""
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
         log.warning("write_endwert: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
         return False
 
-    fields = [f"{ENDWERT_FIELD}={int(endwert)}i"]
-    if username:
-        fields.append(f'{ENDWERT_NAME_FIELD}="{_esc_str(username)}"')
-    # Ohne Zeitstempel - siehe SERVER_TIME_NOTE.
-    line = (
-        f"{ENDWERT_MEASUREMENT},{SCORE_TAG}={_esc_tag(user_id)} "
-        f"{','.join(fields)}\n"
-    )
+    # Ohne Zeitstempel - InfluxDB setzt die Serverzeit.
+    line = f"{MEASUREMENT},{TAG}={_esc_tag(user_id)} {FIELD}={int(endwert)}i\n"
     log.debug("write_endwert -> %s/api/v2/write LINE: %s",
               INFLUX_URL, line.strip())
 
@@ -210,15 +232,16 @@ def write_endwert(
         log.warning("write_endwert HTTP %s: %s | LINE: %s",
                     r.status_code, r.text[:200], line.strip())
         return False
-    log.info("write_endwert OK: user_id=%s endwert=%d username=%r",
-             user_id, endwert, username)
+    log.info("write_endwert OK: %s/%s userid=%s endscore=%d",
+             SCORE_BUCKET, MEASUREMENT, user_id, endwert)
     return True
 
 
 # ---------------------------------------------------------------------------
 # HTTP + Parser-Helfer
 # ---------------------------------------------------------------------------
-def _run_query(flux: str) -> Optional[str]:
+def _run_query(flux: str) -> str:
+    """Schickt eine Flux-Abfrage, liefert die CSV-Antwort. Wirft ``DBError``."""
     log.debug("Flux:\n%s", flux)
     try:
         r = _get_session().post(
@@ -234,10 +257,10 @@ def _run_query(flux: str) -> Optional[str]:
         )
     except requests.RequestException as e:
         log.warning("Flux-Query: Netzwerkfehler %s", e)
-        return None
+        raise DBError(f"Netzwerkfehler: {e}") from e
     if not r.ok:
         log.warning("Flux-Query HTTP %s: %s", r.status_code, r.text[:200])
-        return None
+        raise DBError(f"HTTP {r.status_code}: {r.text[:200]}", r.status_code)
     log.debug("Flux-Antwort (%d bytes): %s", len(r.text), r.text[:300])
     return r.text
 
@@ -265,6 +288,16 @@ def _first_value(csv_text: str) -> Optional[str]:
     return None
 
 
+def _to_int(value: Optional[str]) -> Optional[int]:
+    """``"125"`` / ``"125.0"`` -> 125. Unlesbare Werte wirft ``DBError``."""
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        raise DBError(f"nicht-numerischer Wert {value!r}") from None
+
+
 def _esc_q(s: str) -> str:
     """Escaping für Werte in Flux-Strings."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -276,8 +309,3 @@ def _esc_tag(s: str) -> str:
              .replace(",", r"\,")
              .replace("=", r"\=")
              .replace(" ", r"\ "))
-
-
-def _esc_str(s: str) -> str:
-    """Escaping für String-Field-Werte im Line-Protocol."""
-    return s.replace("\\", "\\\\").replace('"', '\\"')

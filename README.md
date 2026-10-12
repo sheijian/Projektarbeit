@@ -8,10 +8,12 @@ Blackjack-Automat mit:
   `H` / `S` / `D` / `P` / `L`
 - **RFID-Reader hinter einem ESP32** als HTTP-Statusseite
   (Default: `http://10.0.244.81/status`)
-- **InfluxDB-Bucket** (`SpieloAutomat`) – beim Chip-Auflegen wird der
-  letzte Blackjack-Endwert geladen bzw. beim ersten Spiel die Summe der
-  sechs anderen Stationen als Startguthaben; nach jeder Hand wird der
+- **InfluxDB** – beim Chip-Auflegen wird der letzte Blackjack-Endwert aus
+  `SpieloAutomat` geladen bzw. beim ersten Spiel die Summe der sechs
+  Stationen als Startguthaben; nach jeder Hand und beim Logout wird der
   neue Endwert gespeichert
+- **Logout** per Taster K5, Taste `L` oder LOGOUT-Button auf dem
+  Bildschirm (Maus/Touch)
 
 ## Verzeichnisstruktur
 
@@ -30,12 +32,12 @@ Projektarbeit/
 │   ├── buttons.py               # USB-Encoder + Tastatur-Fallback
 │   ├── rfid.py                  # HTTP-RFID-Reader (ESP32)
 │   ├── store.py                 # PlayerStore-Interface + LocalPlayerStore
-│   ├── ppmaster_store.py        # InfluxDB-Store für den PPMaster-Bucket
-│   ├── db_config.py             # Lädt .env-Zugangsdaten
+│   ├── influx_db.py             # alle InfluxDB-Zugriffe + Zugangsdaten
 │   └── config.py                # K-Belegung, Default-URL, Palette
 ├── scripts/
-│   └── find_buttons.py          # Zeigt USB-Button-Nummern an
-└── tests/                       # 64 Tests, alle grün
+│   ├── find_buttons.py          # Zeigt USB-Button-Nummern an
+│   └── punkte.py                # Zeigt die DB-Punkte eines Spielers
+└── tests/
 ```
 
 ## Installation
@@ -90,110 +92,65 @@ das die DB nach dem **tatsächlichen Anzeigenamen** fragt (das Field
 anschließend im HUD als "Spieler: Jonathan". Als Fallback wird der
 `username`-Wert aus der ESP32-Antwort verwendet.
 
-### Datenbank-Zugriffe (`blackjack/influx_db.py`)
+### Datenbank (`blackjack/influx_db.py`)
 
-Alle InfluxDB-Zugriffe stehen in einer einzigen Datei:
+Alle Buckets nutzen dasselbe Schema:
 
-| Funktion                               | Zweck                                                              |
-|----------------------------------------|--------------------------------------------------------------------|
-| `query_username(user_id)`              | Anzeigename aus Bucket **PPMaster** (last)                         |
-| `query_balance(user_id)`               | Kontostand für den Login aus **SpieloAutomat** (siehe unten)       |
-| `write_endwert(user_id, wert, name)`   | Nach jeder Hand: Blackjack-Endwert nach **SpieloAutomat**          |
+| Bucket            | Measurement | Field      | Tag (RFID) | Inhalt                      |
+|-------------------|-------------|------------|------------|-----------------------------|
+| HeisserDraht      | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
+| Ampelsequenz      | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
+| TimerStrike       | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
+| Wurfgenauigkeit   | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
+| Whackamole        | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
+| Gedaechtnistest   | `durchlauf` | `endscore` | `userid`   | Punkte je Durchlauf         |
+| **SpieloAutomat** | `durchlauf` | `endscore` | `userid`   | **Blackjack-Endwert**       |
 
-Im Bucket `SpieloAutomat` liegen pro `user_id` zwei getrennte Werte,
-die sich gegenseitig nie überschreiben:
+Bucket-Namen und Schema stehen oben in `blackjack/influx_db.py`
+(`STATION_BUCKETS`, `MEASUREMENT`, `FIELD`, `TAG`).
 
-| Measurement / Field  | Bedeutung                             | Wer schreibt?                   |
-|----------------------|---------------------------------------|---------------------------------|
-| `endscore` / `score` | **Startguthaben** = Summe der sechs Stationen | nur der Aggregator (alle 5 s) |
-| `blackjack` / `endwert` | **Endwert** nach der letzten Blackjack-Hand | nur Blackjack (nach jeder Hand + beim Logout) |
+**Beim Chip-Auflegen** (`query_balance`):
 
-Beim Chip-Auflegen gilt: **Endwert, falls vorhanden – sonst
-Startguthaben.** Wer schon Blackjack gespielt hat, landet also immer bei
-seinem Blackjack-Endwert, egal was der Aggregator inzwischen schreibt.
-Beides kommt aus einer einzigen Abfrage:
+1. Gibt es in `SpieloAutomat` schon einen Endwert für die `userid`?
+   → Spieler startet genau dort (Blackjack-Endwert).
+2. Sonst: Summe aller Durchläufe aus den sechs Stations-Buckets
+   → Startguthaben. Ein noch nicht angelegter Bucket zählt als 0.
+3. Gar keine Daten → `--starting-balance`.
 
-```flux
-from(bucket: "SpieloAutomat")
-  |> range(start: 0)
-  |> filter(fn: (r) => r.user_id == "<uuid>")
-  |> filter(fn: (r) =>
-       (r._measurement == "blackjack" and r._field == "endwert") or
-       (r._measurement == "endscore" and r._field == "score"))
-  |> last()
+Antwortet die Datenbank nicht, wird **kein** Ersatzwert genommen (sonst
+würde der echte Endwert nach der ersten Hand überschrieben) – das Spiel
+zeigt „Datenbank nicht erreichbar“ und versucht es alle 5 s erneut.
+
+**Gespeichert** wird der Endwert (`write_endwert`) nach jeder Hand und
+beim Logout als `durchlauf,userid=<id> endscore=<wert>` in
+`SpieloAutomat`. Nur Blackjack schreibt dorthin.
+
+Beim Schreiben wird **kein Zeitstempel** mitgeschickt – InfluxDB setzt
+die Serverzeit. Die Uhr des Pi geht ohne Internet/NTP falsch;
+Datenpunkte mit Pi-Zeit landeten z. B. am 19.09. und waren im Data
+Explorer mit „Past 1h“ unsichtbar.
+
+**Punkte eines Spielers prüfen** (auf dem Pi):
+
+```bash
+python -m scripts.punkte 7c3ed021-5099-4d46-9283-002adf814597
 ```
 
-Beim Schreiben schicken Blackjack und Aggregator **keinen Zeitstempel**
-mit – InfluxDB setzt die Serverzeit. Die Uhr des Pi geht ohne
-Internet/NTP falsch; Datenpunkte mit Pi-Zeit landeten z. B. am 19.09.
-und waren im Data Explorer mit „Past 1h“ unsichtbar.
+zeigt die Punkte je Station, das Startguthaben, den Blackjack-Endwert
+und womit der Spieler beim nächsten Login startet.
 
-Endwerte prüfen (Data Explorer → Script Editor):
+### Logout (Taster K5, Taste `L` oder LOGOUT antippen)
 
-```flux
-from(bucket: "SpieloAutomat")
-  |> range(start: 0)
-  |> filter(fn: (r) => r._measurement == "blackjack" and r._field == "endwert")
-  |> last()
-```
+Zwischen zwei Runden meldet Logout den Spieler ab:
 
-### Logout-Taster (K5 / Taste `L`)
-
-Zwischen zwei Runden meldet der Logout-Taster den Spieler ab:
-
-1. Kontostand als Endwert nach `SpieloAutomat` (`blackjack` / `endwert`)
-   schreiben,
+1. Kontostand als Endwert nach `SpieloAutomat` schreiben,
 2. RFID-User am ESP32 abmelden: `GET http://10.0.244.81/logout`
    (abgeleitet aus `--rfid-url`, überschreibbar mit `--logout-url`),
 3. Spieler im Spiel abmelden – „Tschüss …! Endwert: …“.
 
 Schlägt Schritt 1 oder 2 fehl, bleibt der Spieler angemeldet und kann
-nochmal drücken. Mitten in einer Hand ist Logout gesperrt. Zusätzlich
-wird der Endwert nach jeder Hand gespeichert – falls jemand geht, ohne
-Logout zu drücken.
-
-## Score-Aggregator (Hintergrund-Dienst)
-
-Die sechs anderen Spielstationen speichern ihre Endscores jeweils in
-einem eigenen Bucket mit unterschiedlichem Schema:
-
-| Bucket              | Measurement           | Field          | Tag       |
-|---------------------|-----------------------|----------------|-----------|
-| HeisserDraht        | Endscore              | Endscore       | userID    |
-| Ampelsequenz        | endscore              | score          | rfidTag   |
-| TimerStrike         | endscore              | score          | user_id   |
-| Wurfgenauigkeit     | spieler_ergebnisse    | gesamtpunkte   | user_id   |
-| Whackamole          | endscore              | score          | rfidTag   |
-| Gedaechtnistest     | endscore              | endscore       | user_id   |
-
-Das Skript `scripts/score_aggregator.py` läuft dauerhaft auf dem Pi,
-pollt alle 5 Sekunden diese Buckets, summiert pro `user_id` und
-schreibt die Summe als Startguthaben nach `SpieloAutomat`
-(measurement `endscore`, field `score`, tag `user_id`) – allerdings nur
-für User, deren Summe sich seit dem letzten Write geändert hat. Den
-Blackjack-Endwert (`blackjack` / `endwert`) fasst er nie an.
-
-### Manuell starten (zum Testen)
-
-```bash
-python -m scripts.score_aggregator --verbose     # Dauerlauf
-python -m scripts.score_aggregator --once        # ein Durchlauf
-```
-
-### Als Dienst dauerhaft laufen lassen
-
-```bash
-sudo cp scripts/blackjack-aggregator.service /etc/systemd/system/
-# in der Service-Datei User= und WorkingDirectory= an den eigenen
-# Pfad anpassen (admin + ~/Documents/Projektarbeit-... als Default)
-sudo systemctl daemon-reload
-sudo systemctl enable --now blackjack-aggregator.service
-journalctl -u blackjack-aggregator -f            # Logs mitlesen
-```
-
-Der Token muss Lese-Zugriff auf alle sechs Quell-Buckets und Schreib-
-Zugriff auf `SpieloAutomat` haben. Trage ihn – wie beim Blackjack-
-Programm selbst – ganz oben in `blackjack/influx_db.py` ein.
+nochmal drücken. Mitten in einer Hand ist Logout gesperrt. Alle Buttons
+der Aktionsleiste lassen sich auch per Maus/Touchscreen antippen.
 
 ## Steuerung
 

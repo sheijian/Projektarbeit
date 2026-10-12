@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 
 from blackjack import influx_db
+
+
+UID = "7c3ed021-5099-4d46-9283-002adf814597"
 
 
 # ---------------------------------------------------------------------------
@@ -16,8 +20,11 @@ class _Response:
 
 
 class _FakeSession:
-    def __init__(self, response=None, writes_ok=True):
-        self.response = response or _Response()
+    """Antwortet je nach abgefragtem Bucket. ``buckets`` = {name: Response};
+    nicht genannte Buckets liefern ein leeres Ergebnis."""
+
+    def __init__(self, buckets=None, writes_ok=True):
+        self.buckets = buckets or {}
         self.writes_ok = writes_ok
         self.calls = []
 
@@ -27,8 +34,14 @@ class _FakeSession:
             "url": url, "params": params, "headers": headers, "body": body,
         })
         if url.endswith("/write"):
-            return _Response(ok=self.writes_ok)
-        return self.response
+            return _Response(ok=self.writes_ok,
+                             status_code=204 if self.writes_ok else 500)
+        bucket = re.search(r'from\(bucket: "([^"]+)"\)', body).group(1)
+        return self.buckets.get(bucket, _Response(text=EMPTY_CSV))
+
+    def queried(self):
+        return [re.search(r'from\(bucket: "([^"]+)"\)', c["body"]).group(1)
+                for c in self.calls if c["url"].endswith("/query")]
 
 
 @contextmanager
@@ -60,15 +73,25 @@ def _test_env(session):
 
 
 # ---------------------------------------------------------------------------
-SCORE_CSV = (
+def _value_csv(value):
+    """Flux-Antwort mit genau einem Wert (last() oder group()+sum())."""
+    return _Response(text=(
+        "#datatype,string,long,long\r\n"
+        "#group,false,false,false\r\n"
+        "#default,_result,,\r\n"
+        ",result,table,_value\r\n"
+        f",,0,{value}\r\n"
+    ))
+
+
+ENDWERT_CSV = (
     "#datatype,string,long,dateTime:RFC3339,dateTime:RFC3339,"
     "dateTime:RFC3339,long,string,string,string\r\n"
     "#group,false,false,true,true,false,false,true,true,true\r\n"
     "#default,_result,,,,,,,,\r\n"
-    ",result,table,_start,_stop,_time,_value,_field,_measurement,user_id\r\n"
-    ",,0,1970-01-01T00:00:00Z,2026-10-07T10:00:00Z,"
-    "2026-10-06T12:00:00Z,125,score,endscore,"
-    "7c3ed021-5099-4d46-9283-002adf814597\r\n"
+    ",result,table,_start,_stop,_time,_value,_field,_measurement,userid\r\n"
+    ",,0,1970-01-01T00:00:00Z,2026-10-12T10:00:00Z,"
+    f"2026-10-12T09:00:00Z,125,endscore,durchlauf,{UID}\r\n"
 )
 
 USERNAME_CSV = (
@@ -78,30 +101,8 @@ USERNAME_CSV = (
     "#default,_result,,,,,,,,\r\n"
     ",result,table,_start,_stop,_time,_value,_field,_measurement,user_id\r\n"
     ",,0,1970-01-01T00:00:00Z,2026-10-07T10:00:00Z,"
-    "2026-09-30T08:18:02.373Z,Tobias,username,PPMaster,"
-    "7c3ed021-5099-4d46-9283-002adf814597\r\n"
+    f"2026-09-30T08:18:02.373Z,Tobias,username,PPMaster,{UID}\r\n"
 )
-
-UID = "7c3ed021-5099-4d46-9283-002adf814597"
-
-
-def _balance_csv(*rows):
-    """Antwort auf die query_balance-Abfrage: eine Zeile pro Serie,
-    ``rows`` = (measurement, field, value)."""
-    out = (
-        "#datatype,string,long,dateTime:RFC3339,dateTime:RFC3339,"
-        "dateTime:RFC3339,long,string,string,string\r\n"
-        "#group,false,false,true,true,false,false,true,true,true\r\n"
-        "#default,_result,,,,,,,,\r\n"
-        ",result,table,_start,_stop,_time,_value,_field,_measurement,user_id\r\n"
-    )
-    for table, (meas, field, value) in enumerate(rows):
-        out += (
-            f",,{table},1970-01-01T00:00:00Z,2026-10-09T08:45:29Z,"
-            f"2026-09-19T05:55:13Z,{value},{field},{meas},{UID}\r\n"
-        )
-    return out
-
 
 EMPTY_CSV = (
     "#datatype,string,long,string\r\n"
@@ -112,54 +113,130 @@ EMPTY_CSV = (
 
 
 # ---------------------------------------------------------------------------
-# query_balance
+# Schema
 # ---------------------------------------------------------------------------
-def test_query_balance_prefers_blackjack_endwert():
-    """Endwert aus Blackjack schlägt das Startguthaben vom Aggregator -
-    egal in welcher Reihenfolge InfluxDB die Tabellen liefert."""
-    for rows in (
-        [("blackjack", "endwert", 1), ("endscore", "score", 21)],
-        [("endscore", "score", 21), ("blackjack", "endwert", 1)],
-    ):
-        sess = _FakeSession(_Response(text=_balance_csv(*rows)))
-        with _test_env(sess):
-            assert influx_db.query_balance(UID) == 1
+def test_unified_schema():
+    assert (influx_db.MEASUREMENT, influx_db.FIELD, influx_db.TAG) == (
+        "durchlauf", "endscore", "userid",
+    )
+    assert set(influx_db.STATION_BUCKETS) == {
+        "HeisserDraht", "Ampelsequenz", "TimerStrike",
+        "Wurfgenauigkeit", "Whackamole", "Gedaechtnistest",
+    }
+    assert influx_db.SCORE_BUCKET == "SpieloAutomat"
+    assert influx_db.SCORE_BUCKET not in influx_db.STATION_BUCKETS
 
 
-def test_query_balance_falls_back_to_startguthaben():
-    sess = _FakeSession(_Response(text=_balance_csv(("endscore", "score", 21))))
+# ---------------------------------------------------------------------------
+# query_station_points
+# ---------------------------------------------------------------------------
+def test_station_points_queries_all_six_with_unified_schema():
+    sess = _FakeSession()
     with _test_env(sess):
-        assert influx_db.query_balance(UID) == 21
+        influx_db.query_station_points(UID)
+    assert sess.queried() == list(influx_db.STATION_BUCKETS)
+    for call in sess.calls:
+        body = call["body"]
+        assert 'r._measurement == "durchlauf" and r._field == "endscore"' in body
+        assert f'r.userid == "{UID}"' in body
+        assert "|> group()" in body and "|> sum()" in body
+
+
+def test_station_points_skips_stations_without_data():
+    sess = _FakeSession({
+        "HeisserDraht": _value_csv(10),
+        "Whackamole":   _value_csv(11),
+    })
+    with _test_env(sess):
+        assert influx_db.query_station_points(UID) == {
+            "HeisserDraht": 10, "Whackamole": 11,
+        }
+
+
+def test_station_points_missing_bucket_counts_as_zero():
+    sess = _FakeSession({
+        "HeisserDraht": _value_csv(10),
+        "TimerStrike":  _Response(ok=False, status_code=404,
+                                  text='{"code":"not found"}'),
+    })
+    with _test_env(sess):
+        assert influx_db.query_station_points(UID) == {"HeisserDraht": 10}
+
+
+def test_station_points_raises_on_db_error():
+    sess = _FakeSession({
+        "Ampelsequenz": _Response(ok=False, status_code=500, text="boom"),
+    })
+    with _test_env(sess):
+        try:
+            influx_db.query_station_points(UID)
+        except influx_db.DBError as e:
+            assert e.status == 500
+        else:
+            raise AssertionError("DBError erwartet")
+
+
+# ---------------------------------------------------------------------------
+# query_endwert / query_balance
+# ---------------------------------------------------------------------------
+def test_query_endwert_reads_spieloautomat():
+    sess = _FakeSession({"SpieloAutomat": _Response(text=ENDWERT_CSV)})
+    with _test_env(sess):
+        assert influx_db.query_endwert(UID) == 125
+    body = sess.calls[0]["body"]
+    assert 'from(bucket: "SpieloAutomat")' in body
+    assert 'r._measurement == "durchlauf" and r._field == "endscore"' in body
+    assert f'r.userid == "{UID}"' in body
+    assert "|> last()" in body
+
+
+def test_query_balance_prefers_blackjack_endwert():
+    sess = _FakeSession({
+        "SpieloAutomat": _value_csv(1),
+        "HeisserDraht":  _value_csv(21),
+    })
+    with _test_env(sess):
+        assert influx_db.query_balance(UID) == 1
+    # Mit Endwert müssen die Stationen gar nicht erst gefragt werden.
+    assert sess.queried() == ["SpieloAutomat"]
 
 
 def test_query_balance_endwert_zero_is_kept():
     """Endwert 0 (alles verspielt) ist ein gültiger Wert, kein "leer"."""
-    sess = _FakeSession(_Response(text=_balance_csv(
-        ("blackjack", "endwert", 0), ("endscore", "score", 21),
-    )))
+    sess = _FakeSession({
+        "SpieloAutomat": _value_csv(0),
+        "HeisserDraht":  _value_csv(21),
+    })
     with _test_env(sess):
         assert influx_db.query_balance(UID) == 0
 
 
-def test_query_balance_sends_one_query_for_both_values():
-    sess = _FakeSession(_Response(text=SCORE_CSV))
+def test_query_balance_sums_stations_as_startguthaben():
+    sess = _FakeSession({
+        "HeisserDraht":    _value_csv(5),
+        "Ampelsequenz":    _value_csv(4),
+        "Gedaechtnistest": _value_csv(12),
+    })
     with _test_env(sess):
-        assert influx_db.query_balance(UID) == 125
-    assert len(sess.calls) == 1
-    call = sess.calls[0]
-    assert call["url"] == "http://example.local/api/v2/query"
-    assert call["params"] == {"org": "o"}
-    assert call["headers"]["Authorization"] == "Token tr"
-    body = call["body"]
-    assert 'from(bucket: "SpieloAutomat")' in body
-    assert 'r._measurement == "blackjack" and r._field == "endwert"' in body
-    assert 'r._measurement == "endscore" and r._field == "score"' in body
-    assert f'r.user_id == "{UID}"' in body
+        assert influx_db.query_balance(UID) == 21
 
 
-def test_query_balance_returns_none_on_empty():
-    with _test_env(_FakeSession(_Response(text=EMPTY_CSV))):
+def test_query_balance_none_without_any_data():
+    with _test_env(_FakeSession()):
         assert influx_db.query_balance("unknown") is None
+
+
+def test_query_balance_raises_instead_of_guessing_on_db_error():
+    sess = _FakeSession({
+        "SpieloAutomat": _Response(ok=False, status_code=401, text="unauth"),
+    })
+    with _test_env(sess):
+        try:
+            influx_db.query_balance(UID)
+        except influx_db.DBError:
+            pass
+        else:
+            raise AssertionError("DBError erwartet")
 
 
 def test_query_balance_returns_none_when_not_configured():
@@ -171,74 +248,45 @@ def test_query_balance_returns_none_when_not_configured():
         influx_db.INFLUX_TOKEN_READ = old
 
 
-def test_query_balance_returns_none_on_http_error():
-    with _test_env(_FakeSession(
-        _Response(ok=False, status_code=401, text="unauthorized"),
-    )):
-        assert influx_db.query_balance("uid") is None
-
-
 # ---------------------------------------------------------------------------
 # query_username
 # ---------------------------------------------------------------------------
 def test_query_username_parses_last_value():
-    sess = _FakeSession(_Response(text=USERNAME_CSV))
+    sess = _FakeSession({"PPMaster": _Response(text=USERNAME_CSV)})
     with _test_env(sess):
-        assert influx_db.query_username(
-            "7c3ed021-5099-4d46-9283-002adf814597",
-        ) == "Tobias"
+        assert influx_db.query_username(UID) == "Tobias"
     body = sess.calls[0]["body"]
     assert 'from(bucket: "PPMaster")' in body
     assert 'r._measurement == "PPMaster"' in body
     assert 'r._field == "username"' in body
-    assert 'r.user_id == "7c3ed021-5099-4d46-9283-002adf814597"' in body
+    assert f'r.user_id == "{UID}"' in body
 
 
-def test_query_username_returns_none_on_empty():
-    with _test_env(_FakeSession(_Response(text=EMPTY_CSV))):
+def test_query_username_returns_none_on_empty_or_error():
+    with _test_env(_FakeSession()):
+        assert influx_db.query_username("uid") is None
+    with _test_env(_FakeSession({"PPMaster": _Response(ok=False,
+                                                       status_code=500)})):
         assert influx_db.query_username("uid") is None
 
 
 # ---------------------------------------------------------------------------
 # write_endwert
 # ---------------------------------------------------------------------------
-def test_write_endwert_sends_line_protocol():
+def test_write_endwert_uses_unified_schema():
     sess = _FakeSession()
     with _test_env(sess):
-        assert influx_db.write_endwert("abc-uid", 40) is True
+        assert influx_db.write_endwert(UID, 1) is True
     call = sess.calls[0]
     assert call["url"] == "http://example.local/api/v2/write"
     assert call["params"] == {
         "org": "o", "bucket": "SpieloAutomat", "precision": "ms",
     }
     assert call["headers"]["Authorization"] == "Token tw"
-    lines = call["body"].strip().splitlines()
     # Ohne Zeitstempel - InfluxDB setzt die Serverzeit (Pi-Uhr geht falsch).
-    assert lines == ["blackjack,user_id=abc-uid endwert=40i"]
-
-
-def test_write_endwert_never_touches_aggregator_measurement():
-    """Das Startguthaben (endscore) gehört allein dem Aggregator."""
-    sess = _FakeSession()
-    with _test_env(sess):
-        assert influx_db.write_endwert(UID, 1, username="Tobias")
-    assert not sess.calls[0]["body"].startswith("endscore")
-
-
-def test_write_endwert_adds_username_field():
-    sess = _FakeSession()
-    with _test_env(sess):
-        assert influx_db.write_endwert(UID, 125, username="Tobias")
-    line = sess.calls[0]["body"].strip()
-    assert line == f'blackjack,user_id={UID} endwert=125i,username="Tobias"'
-
-
-def test_write_endwert_escapes_quotes_in_username():
-    sess = _FakeSession()
-    with _test_env(sess):
-        assert influx_db.write_endwert("uid-x", 10, username='A"B\\C')
-    line = sess.calls[0]["body"]
-    assert r'username="A\"B\\C"' in line
+    assert call["body"].strip().splitlines() == [
+        f"durchlauf,userid={UID} endscore=1i",
+    ]
 
 
 def test_write_endwert_returns_false_when_not_configured():
@@ -259,7 +307,7 @@ def test_write_endwert_returns_false_on_http_error():
 # Low-Level
 # ---------------------------------------------------------------------------
 def test_first_value_handles_annotations_and_empty():
-    assert influx_db._first_value(SCORE_CSV) == "125"
+    assert influx_db._first_value(ENDWERT_CSV) == "125"
     assert influx_db._first_value(USERNAME_CSV) == "Tobias"
     assert influx_db._first_value("") is None
     assert influx_db._first_value(EMPTY_CSV) is None
@@ -267,13 +315,18 @@ def test_first_value_handles_annotations_and_empty():
 
 def test_rows_handles_tables_with_own_headers():
     """Tabellen mit unterschiedlichem Schema kommen als eigene Blöcke."""
-    text = SCORE_CSV + "\r\n" + USERNAME_CSV
+    text = ENDWERT_CSV + "\r\n" + USERNAME_CSV
     rows = list(influx_db._rows(text))
-    assert [r["_measurement"] for r in rows] == ["endscore", "PPMaster"]
+    assert [r["_measurement"] for r in rows] == ["durchlauf", "PPMaster"]
     assert [r["_value"] for r in rows] == ["125", "Tobias"]
+
+
+def test_to_int_accepts_float_sums():
+    assert influx_db._to_int("21") == 21
+    assert influx_db._to_int("21.0") == 21
+    assert influx_db._to_int(None) is None
 
 
 def test_escapers():
     assert influx_db._esc_q('A"B\\C') == r'A\"B\\C'
     assert influx_db._esc_tag("a b,c=d") == r"a\ b\,c\=d"
-    assert influx_db._esc_str('x"y\\z') == r'x\"y\\z'

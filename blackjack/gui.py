@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pygame
 
@@ -55,6 +55,11 @@ class BlackjackGUI:
 
         self._now: float = time.monotonic()
 
+        # Für Maus/Touch: Skalierung + Versatz der letzten Ausgabe und die
+        # Rechtecke der aktiven Buttons (logische Koordinaten, Aktion).
+        self._view: Tuple[float, int, int] = (1.0, 0, 0)
+        self._buttons: List[Tuple[pygame.Rect, str]] = []
+
     # ------------------------------------------------------------------
     def toggle_fullscreen(self) -> None:
         self._fullscreen = not self._fullscreen
@@ -89,9 +94,22 @@ class BlackjackGUI:
         scale = min(ww / lw, wh / lh)
         tw, th = max(1, int(lw * scale)), max(1, int(lh * scale))
         scaled = pygame.transform.smoothscale(self.screen, (tw, th))
+        ox, oy = (ww - tw) // 2, (wh - th) // 2
+        self._view = (scale, ox, oy)
         self.window.fill((0, 0, 0))
-        self.window.blit(scaled, ((ww - tw) // 2, (wh - th) // 2))
+        self.window.blit(scaled, (ox, oy))
         pygame.display.flip()
+
+    def action_at(self, window_pos: Tuple[int, int]) -> Optional[str]:
+        """Aktion des aktiven Buttons unter der Maus/dem Finger - oder
+        ``None``. ``window_pos`` sind Fensterkoordinaten (skaliert)."""
+        scale, ox, oy = self._view
+        x = (window_pos[0] - ox) / scale
+        y = (window_pos[1] - oy) / scale
+        for rect, action in self._buttons:
+            if rect.collidepoint(x, y):
+                return action
+        return None
 
     def close(self) -> None:
         pygame.quit()
@@ -358,35 +376,40 @@ class BlackjackGUI:
         in_bet_phase = game.state in (State.BETTING, State.ROUND_OVER)
         current_hand = self._current_hand()
 
+        # (Beschriftung, Taste, aktiv?, Aktion beim Antippen)
         if in_bet_phase:
             actions = [
-                ("EINSATZ +", "H", game.player is not None),
+                ("EINSATZ +", "H", game.player is not None, "hit"),
                 ("DEAL",      "S", game.player is not None
-                                    and game.player.balance >= game.current_bet),
-                ("DOUBLE",    "D", False),
-                ("SPLIT",     "P", False),
+                                    and game.player.balance >= game.current_bet,
+                 "stand"),
+                ("DOUBLE",    "D", False, "double"),
+                ("SPLIT",     "P", False, "split"),
             ]
         else:
             actions = [
-                ("HIT",    "H", game.state == State.PLAYER_TURN),
-                ("STAND",  "S", game.state == State.PLAYER_TURN),
+                ("HIT",    "H", game.state == State.PLAYER_TURN, "hit"),
+                ("STAND",  "S", game.state == State.PLAYER_TURN, "stand"),
                 ("DOUBLE", "D", game.state == State.PLAYER_TURN
                                  and current_hand is not None
-                                 and current_hand.can_double),
+                                 and current_hand.can_double, "double"),
                 ("SPLIT",  "P", game.state == State.PLAYER_TURN
                                  and current_hand is not None
-                                 and current_hand.can_split),
+                                 and current_hand.can_split, "split"),
             ]
-        # Logout (K5) - nur zwischen den Runden aktiv.
-        actions.append(("LOGOUT", "L", game.can_logout))
+        # Logout (K5 / L / antippen) - nur zwischen den Runden aktiv.
+        actions.append(("LOGOUT", "L", game.can_logout, "logout"))
 
         btn_w = 180
         spacing = 20
         total = len(actions) * btn_w + (len(actions) - 1) * spacing
         x = (w - total) // 2
 
-        for label, key, enabled in actions:
+        self._buttons = []
+        for label, key, enabled, action in actions:
             rect = pygame.Rect(x, y, btn_w, 50)
+            if enabled:
+                self._buttons.append((rect, action))
             color = PALETTE.accent if enabled else (80, 80, 80)
             text_color = PALETTE.text_dark if enabled else (160, 160, 160)
             pygame.draw.rect(self.screen, color, rect, border_radius=10)
