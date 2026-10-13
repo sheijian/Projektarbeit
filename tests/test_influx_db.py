@@ -386,6 +386,21 @@ def test_write_spielstand_live_and_luck_at_logout():
     ]
 
 
+def test_all_written_values_are_integers():
+    """Anforderung Dashboard: live und endscore nur als Ganzzahl (InfluxDB-
+    Typ integer, Suffix "i") - nie mit Komma."""
+    sess = _FakeSession()
+    with _test_env(sess):
+        influx_db.write_spielstand(UID, live=89, glueck=67)
+        influx_db.write_spielstand(UID, live=89)
+        influx_db.write_spielstand(UID, glueck=0)
+    lines = [l for c in sess.calls for l in c["body"].strip().splitlines()]
+    assert len(lines) == 5
+    for line in lines:
+        for field in line.split(" ", 1)[1].split(","):
+            assert re.fullmatch(r"(live|endscore)=-?\d+i", field), line
+
+
 def test_write_spielstand_luck_only():
     sess = _FakeSession()
     with _test_env(sess):

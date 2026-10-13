@@ -246,3 +246,17 @@ def test_luck_percent_counts_real_rounds():
     assert game.luck_percent == 50
     game.logout()
     assert game.luck_percent is None             # neuer Durchlauf
+
+
+def test_balance_and_luck_stay_integers_with_3_to_2_payout():
+    """Blackjack zahlt 3:2 - bei Einsatz 25 wären das 37,5. Guthaben und
+    Glücksfaktor bleiben trotzdem Ganzzahlen (für die Datenbank)."""
+    game = Game()
+    # Spieler A + K = Blackjack, Dealer 9 + 7.
+    game.deck = StackedDeck([C("A"), C("9"), C("K"), C("7")])
+    game.login(Player("uid", "T", 100), default_bet=25)
+    game.start_round()
+    assert game.results[0].outcome.value == "blackjack"
+    assert game.player.balance == 100 + 37          # 37,5 -> 37
+    assert type(game.player.balance) is int
+    assert type(game.luck_percent) is int and game.luck_percent == 100
