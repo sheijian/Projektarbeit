@@ -8,6 +8,9 @@ Antwort hat das Format:
     {"status":"logged_in", "userid":"d83751ae-...", "username":"Jonathan",
      "runid":"5", "time":178}
 
+``runid`` zählt die Durchläufe eines Teilnehmers (gleiche Karte, neuer
+Run = neuer Durchlauf durch alle Stationen).
+
 Nur wenn ``status == "logged_in"`` wird die ``userid`` zurückgegeben
 und ein Login im Spiel ausgelöst. Jeder andere Status (``idle``,
 ``logged_out``, ...) bedeutet "kein Chip aufgelegt".
@@ -40,6 +43,9 @@ POSITIVE_STATUS = "logged_in"
 # Bekannte Schlüssel, unter denen der Server die UUID liefert
 # (aktuell "userid", früher "user_id").
 _ID_KEYS = ("userid", "user_id", "uid")
+
+# Bekannte Schlüssel, unter denen der Server die Run-Nummer liefert.
+_RUN_KEYS = ("runid", "run_id")
 
 # Bekannte Schlüssel, unter denen der Server den Anzeigenamen liefert.
 _NAME_KEYS = ("username", "user_name", "name", "display_name")
@@ -90,6 +96,19 @@ def _extract_scan(payload) -> tuple[Optional[str], Optional[str]]:
     return uid, name
 
 
+def _extract_runid(payload) -> Optional[str]:
+    """``runid`` aus der JSON-Antwort (nur bei ``logged_in``), sonst None."""
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status", "")).strip().lower() != POSITIVE_STATUS:
+        return None
+    for key in _RUN_KEYS:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value).strip() or None
+    return None
+
+
 # ---------------------------------------------------------------------------
 class HTTPRFIDReader:
     """Pollt die ESP32-Statusseite und liefert Login-Events."""
@@ -113,12 +132,15 @@ class HTTPRFIDReader:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._last_uid: Optional[str] = None
+        self._last_runid: Optional[str] = None
         self._last_seen: float = 0.0
         # Nach unserem Logout meldet der ESP32 evtl. noch kurz den alten
         # User - diese UID ignorieren, bis einmal "nicht eingeloggt" kam.
         self._ignore_uid: Optional[str] = None
         # Von UID auf zuletzt gesehenen Anzeigenamen (für "Spieler:" im HUD).
         self._names: Dict[str, str] = {}
+        # Von UID auf aktuelle Run-Nummer.
+        self._runids: Dict[str, str] = {}
 
         self._session = requests.Session()
         self._thread = threading.Thread(
@@ -131,32 +153,38 @@ class HTTPRFIDReader:
     # ------------------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
-            uid = self._fetch_uid()
-            self._process_uid(uid)
+            uid, runid = self._fetch_uid()
+            self._process_uid(uid, runid)
             self._stop.wait(self.POLL_INTERVAL)
 
-    def _fetch_uid(self) -> Optional[str]:
+    def _fetch_uid(self) -> tuple[Optional[str], Optional[str]]:
+        """``(userid, runid)`` von der Statusseite - beides None, wenn
+        niemand eingeloggt ist oder der ESP32 nicht antwortet."""
         try:
             r = self._session.get(self.url, timeout=self.timeout)
         except requests.RequestException as e:
             log.debug("HTTP-RFID Verbindungsfehler: %s", e)
-            return None
+            return None, None
         if not r.ok:
             log.debug("HTTP-RFID HTTP %s", r.status_code)
-            return None
+            return None, None
 
         try:
             data = r.json()
         except ValueError:
             log.debug("HTTP-RFID: Antwort ist kein JSON (%s)", r.text[:80])
-            return None
+            return None, None
 
         uid, name = _extract_scan(data)
+        runid = _extract_runid(data)
         if uid and name:
             self._names[uid] = name
-        return uid
+        if uid and runid:
+            self._runids[uid] = runid
+        return uid, runid
 
-    def _process_uid(self, uid: Optional[str]) -> None:
+    def _process_uid(self, uid: Optional[str],
+                     runid: Optional[str] = None) -> None:
         with self._lock:
             now = time.monotonic()
             if uid is None:
@@ -169,9 +197,12 @@ class HTTPRFIDReader:
             if uid == self._ignore_uid:
                 return
             self._last_seen = now
-            if uid != self._last_uid:
-                log.info("HTTP-RFID: neue ID %s", uid)
+            # Neuer Login: andere Karte - oder gleiche Karte, neuer Run.
+            new_run = runid is not None and runid != self._last_runid
+            if uid != self._last_uid or new_run:
+                log.info("HTTP-RFID: neue ID %s (runid %s)", uid, runid)
                 self._last_uid = uid
+                self._last_runid = runid
                 self.events.put(uid)
 
     # ------------------------------------------------------------------
@@ -180,6 +211,10 @@ class HTTPRFIDReader:
     def get_name_hint(self, uid: str) -> Optional[str]:
         """Zuletzt gesehener Anzeigename zu dieser UID (falls bekannt)."""
         return self._names.get(uid)
+
+    def get_runid(self, uid: str) -> Optional[str]:
+        """Aktuelle Run-Nummer dieser UID laut ESP32 (falls bekannt)."""
+        return self._runids.get(uid)
 
     def logout(self) -> bool:
         """Meldet den aktuellen RFID-User am ESP32 ab (``GET <logout_url>``).
@@ -201,6 +236,7 @@ class HTTPRFIDReader:
         with self._lock:
             self._ignore_uid = self._last_uid
             self._last_uid = None
+            self._last_runid = None
         log.info("RFID-Logout OK (%s)", self.logout_url)
         return True
 

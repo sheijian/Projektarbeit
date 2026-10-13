@@ -1,7 +1,9 @@
 """Tests für den HTTP-RFID-Extraktor (ESP32-Status)."""
 
 from blackjack import rfid as rfid_mod
-from blackjack.rfid import HTTPRFIDReader, _extract_scan, _normalize_id
+from blackjack.rfid import (
+    HTTPRFIDReader, _extract_runid, _extract_scan, _normalize_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -192,3 +194,32 @@ def test_logout_falls_back_to_post_on_405():
     finally:
         restore()
     assert [m for m, _ in calls] == ["GET", "POST"]
+
+
+# ---------------------------------------------------------------------------
+# Runs (runid)
+# ---------------------------------------------------------------------------
+def test_extract_runid_from_current_esp32_format():
+    payload = {"status": "logged_in", "userid": "abc", "username": "J",
+               "runid": "5", "time": 178}
+    assert _extract_runid(payload) == "5"
+    assert _extract_runid({"status": "logged_in", "run_id": 3}) == "3"
+    assert _extract_runid({"status": "idle", "runid": "5"}) is None
+    assert _extract_runid({"status": "logged_in", "runid": ""}) is None
+
+
+def test_same_card_new_run_is_a_new_login():
+    reader = _reader()
+    reader._process_uid("abc", "5")
+    assert _events(reader) == ["abc"]
+    reader._process_uid("abc", "5")             # gleicher Run: nichts
+    assert _events(reader) == []
+    reader._process_uid("abc", "6")             # neuer Run: neuer Login
+    assert _events(reader) == ["abc"]
+
+
+def test_without_runid_behaves_like_before():
+    reader = _reader()
+    reader._process_uid("abc")
+    reader._process_uid("abc")
+    assert _events(reader) == ["abc"]

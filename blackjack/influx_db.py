@@ -11,14 +11,21 @@ Unser eigener Bucket ``SpieloAutomat`` (Tag "userid", measurement/field):
     durchlauf/live               Guthaben nach jeder Hand (Dashboard)
     durchlauf/endscore           Glücksfaktor = gewonnene / gespielte
                                  Hände in % - beim Logout (Dashboard)
+    .../runid                    Run-Nummer (vom ESP32) als zusätzliches
+                                 Field in jedem Datenpunkt
 
-    query_balance(userid)        -> int | None   Kontostand für den Login
-    query_kontostand(userid)     -> int | None   endscore_stationen/endscore
+Runs: Eine Karte kann mehrere Runs spielen (runid vom ESP32). Pro Run
+zählen nur die Stationspunkte dieses Runs; ein neuer Run startet wieder
+mit diesen. Alte Runs werden NICHT überschrieben - ``last()`` liefert
+automatisch den neuesten Run, die alten bleiben als Verlauf erhalten.
+
+    query_balance(userid, runid) -> int | None   Kontostand für den Login
+    query_kontostand(userid, runid) -> int | None   endscore_stationen/endscore
     query_live(userid)           -> int | None   durchlauf/live
     query_glueck(userid)         -> int | None   durchlauf/endscore
-    query_station_points(userid) -> {bucket: punkte}  (die sechs Stationen)
+    query_station_points(userid, runid) -> {bucket: punkte}  (sechs Stationen)
     query_username(userid)       -> str | None   Anzeigename (PPMaster)
-    write_spielstand(userid, live, glueck) -> bool  nach SpieloAutomat
+    write_spielstand(userid, live, glueck, runid) -> bool  nach SpieloAutomat
     delete_spielstand(userid)    -> bool         alles des Spielers löschen
     list_schema(bucket)          -> [(measurement, field, tags)]  Diagnose
 
@@ -71,6 +78,8 @@ TAG         = "userid"
 # akzeptiert beides - so zählen alte und neue Durchläufe.
 STATION_SCHEMAS = (("durchlauf", "endscore"), ("endscore", "score"))
 STATION_TAGS    = ("userid", "user_id")
+# Tag der Run-Nummer an den Stationen (Gedaechtnistest: "run_id").
+RUN_TAGS        = ("runid", "run_id")
 
 # Die sechs Spielstationen - ihre Summe ist das Startguthaben.
 STATION_BUCKETS = (
@@ -90,6 +99,9 @@ FIELD_GLUECK = FIELD         # "endscore" = Glücksfaktor in % (0..100)
 # Kontostand, aus dem der Login lädt (nach jeder Hand geschrieben):
 KONTO_MEASUREMENT = "endscore_stationen"
 KONTO_FIELD       = "endscore"
+# Run-Nummer als Field (nicht als Tag) - so bleibt es pro Spieler EINE
+# Serie und das Leaderboard zeigt mit last() automatisch den neuesten Run.
+FIELD_RUNID = "runid"         # str
 
 # PPMaster speichert pro RFID-Chip den Anzeigenamen (gefüllt vom ESP32).
 USERNAME_BUCKET      = "PPMaster"
@@ -131,13 +143,14 @@ def _is_configured() -> bool:
 # ---------------------------------------------------------------------------
 # Lesen
 # ---------------------------------------------------------------------------
-def query_balance(userid: str) -> Optional[int]:
+def query_balance(userid: str, runid: Optional[str] = None) -> Optional[int]:
     """Kontostand für den Login.
 
-    Hat der Spieler schon Blackjack gespielt, ist das sein letzter
-    Kontostand aus SpieloAutomat (``endscore_stationen/endscore``) - sonst
-    die Summe seiner Punkte aus den sechs Stationen (Startguthaben).
-    ``None``, wenn es nirgends Daten gibt.
+    Hat der Spieler in diesem Run schon Blackjack gespielt, ist das sein
+    letzter Kontostand aus SpieloAutomat (``endscore_stationen/endscore``)
+    - sonst die Summe seiner Punkte aus den sechs Stationen in diesem Run
+    (Startguthaben). ``None``, wenn es nirgends Daten gibt. Ohne ``runid``
+    werden Runs nicht unterschieden.
 
     Wirft ``DBError``, wenn die DB nicht antwortet - dann darf auf keinen
     Fall ein Ersatzwert genommen werden, sonst würde der echte Kontostand
@@ -146,24 +159,43 @@ def query_balance(userid: str) -> Optional[int]:
     if not _is_configured():
         log.warning("query_balance: InfluxDB nicht konfiguriert")
         return None
-    konto = query_kontostand(userid)
+    konto = query_kontostand(userid, runid)
     if konto is not None:
-        log.info("query_balance: userid=%s -> %d (letzter Kontostand, %s/%s)",
-                 userid, konto, KONTO_MEASUREMENT, KONTO_FIELD)
+        log.info("query_balance: userid=%s runid=%s -> %d (letzter "
+                 "Kontostand, %s/%s)", userid, runid, konto,
+                 KONTO_MEASUREMENT, KONTO_FIELD)
         return konto
-    points = query_station_points(userid)
+    points = query_station_points(userid, runid)
     if not points:
-        log.info("query_balance: keine Punkte für userid=%s", userid)
+        log.info("query_balance: keine Punkte für userid=%s runid=%s",
+                 userid, runid)
         return None
     total = sum(points.values())
-    log.info("query_balance: userid=%s -> %d (Startguthaben aus %s)",
-             userid, total, points)
+    log.info("query_balance: userid=%s runid=%s -> %d (Startguthaben aus %s)",
+             userid, runid, total, points)
     return total
 
 
-def query_kontostand(userid: str) -> Optional[int]:
-    """Letzter Kontostand (``endscore_stationen/endscore``). Wirft ``DBError``."""
-    return _query_last(userid, KONTO_MEASUREMENT, KONTO_FIELD)
+def query_kontostand(userid: str, runid: Optional[str] = None) -> Optional[int]:
+    """Letzter Kontostand (``endscore_stationen/endscore``). Mit ``runid``
+    nur, wenn er aus diesem Run stammt - sonst ``None`` (neuer Run).
+    Wirft ``DBError``."""
+    if runid is None:
+        return _query_last(userid, KONTO_MEASUREMENT, KONTO_FIELD)
+    flux = (
+        f'from(bucket: "{SCORE_BUCKET}")\n'
+        f'  |> range(start: 0)\n'
+        f'  |> filter(fn: (r) => r._measurement == "{KONTO_MEASUREMENT}" and '
+        f'r.{TAG} == "{_esc_q(userid)}")\n'
+        f'  |> filter(fn: (r) => r._field == "{KONTO_FIELD}" or '
+        f'r._field == "{FIELD_RUNID}")\n'
+        f'  |> last()\n'
+    )
+    latest = {row.get("_field"): row.get("_value")
+              for row in _rows(_run_query(flux))}
+    if latest.get(FIELD_RUNID) != str(runid):
+        return None
+    return _to_int(latest.get(KONTO_FIELD) or None)
 
 
 def query_live(userid: str) -> Optional[int]:
@@ -188,10 +220,18 @@ def _query_last(userid: str, measurement: str, field: str) -> Optional[int]:
     return _to_int(_first_value(_run_query(flux)))
 
 
-def query_station_points(userid: str) -> Dict[str, int]:
-    """Punkte pro Station (Summe aller Durchläufe, siehe STATION_SCHEMAS).
-    Stationen ohne Daten fehlen im Ergebnis. Ein noch nicht angelegter
-    Bucket zählt als 0, jeder andere Fehler wirft ``DBError``."""
+def query_station_points(
+    userid: str,
+    runid: Optional[str] = None,
+) -> Dict[str, int]:
+    """Punkte pro Station (Summe der Durchläufe, siehe STATION_SCHEMAS) -
+    mit ``runid`` nur die aus diesem Run (Tag runid/run_id). Stationen ohne
+    Daten fehlen im Ergebnis. Ein noch nicht angelegter Bucket zählt als 0,
+    jeder andere Fehler wirft ``DBError``."""
+    run_filter = (
+        f'  |> filter(fn: (r) => {_tag_match(RUN_TAGS, str(runid))})\n'
+        if runid is not None else ""
+    )
     points: Dict[str, int] = {}
     for bucket in STATION_BUCKETS:
         flux = (
@@ -199,6 +239,7 @@ def query_station_points(userid: str) -> Dict[str, int]:
             f'  |> range(start: 0)\n'
             f'  |> filter(fn: (r) => {_schema_match(STATION_SCHEMAS)})\n'
             f'  |> filter(fn: (r) => {_tag_match(STATION_TAGS, userid)})\n'
+            f'{run_filter}'
             # int und float dürfen beim group() nicht gemischt werden.
             f'  |> toFloat()\n'
             f'  |> group()\n'
@@ -250,6 +291,7 @@ def write_spielstand(
     userid: str,
     live: Optional[int] = None,
     glueck: Optional[int] = None,
+    runid: Optional[str] = None,
 ) -> bool:
     """Schreibt Guthaben und/oder Glücksfaktor nach SpieloAutomat - in
     einem Request::
@@ -258,7 +300,8 @@ def write_spielstand(
         endscore_stationen,userid=<id> endscore=<guthaben>i
 
     ``live`` geht an beide Stellen (Dashboard + Kontostand für den Login),
-    ``glueck`` nur nach durchlauf/endscore.
+    ``glueck`` nur nach durchlauf/endscore. Mit ``runid`` bekommt jeder
+    Datenpunkt zusätzlich das Field ``runid="<nr>"``.
     """
     if not INFLUX_URL or not INFLUX_ORG or not INFLUX_TOKEN_WRITE:
         log.warning("write_spielstand: INFLUX_TOKEN_WRITE fehlt in influx_db.py")
@@ -271,11 +314,12 @@ def write_spielstand(
         fields.append(f"{FIELD_GLUECK}={int(glueck)}i")
     if not fields:
         return True
+    run = f',{FIELD_RUNID}="{_esc_str(str(runid))}"' if runid is not None else ""
 
     # Ohne Zeitstempel - InfluxDB setzt die Serverzeit.
-    line = f"{MEASUREMENT},{tag} {','.join(fields)}\n"
+    line = f"{MEASUREMENT},{tag} {','.join(fields)}{run}\n"
     if live is not None:
-        line += f"{KONTO_MEASUREMENT},{tag} {KONTO_FIELD}={int(live)}i\n"
+        line += f"{KONTO_MEASUREMENT},{tag} {KONTO_FIELD}={int(live)}i{run}\n"
     log.debug("write_spielstand -> %s/api/v2/write LINE: %s",
               INFLUX_URL, line.strip())
 
@@ -442,6 +486,11 @@ def _tag_match(tags, value: str) -> str:
 
 def _esc_q(s: str) -> str:
     """Escaping für Werte in Flux-Strings."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _esc_str(s: str) -> str:
+    """Escaping für String-Field-Werte im Line-Protocol."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 

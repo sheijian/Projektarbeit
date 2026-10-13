@@ -491,3 +491,87 @@ def test_to_int_accepts_float_sums():
 def test_escapers():
     assert influx_db._esc_q('A"B\\C') == r'A\"B\\C'
     assert influx_db._esc_tag("a b,c=d") == r"a\ b\,c\=d"
+
+
+# ---------------------------------------------------------------------------
+# Runs (runid)
+# ---------------------------------------------------------------------------
+def _konto_csv(endscore=None, runid=None):
+    """Antwort auf query_kontostand mit runid: je Field eine Tabelle -
+    unterschiedliche Typen, also eigene Header-Blöcke wie bei InfluxDB."""
+    out = ""
+    if endscore is not None:
+        out += (",result,table,_value,_field\r\n"
+                f",_result,0,{endscore},endscore\r\n\r\n")
+    if runid is not None:
+        out += (",result,table,_value,_field\r\n"
+                f",_result,1,{runid},runid\r\n")
+    return _Response(text=out)
+
+
+def test_station_points_only_from_current_run():
+    sess = _FakeSession()
+    with _test_env(sess):
+        influx_db.query_station_points(UID, "5")
+    body = sess.calls[0]["body"]
+    assert '(exists r.runid and r.runid == "5")' in body
+    assert '(exists r.run_id and r.run_id == "5")' in body
+
+
+def test_station_points_without_runid_has_no_run_filter():
+    sess = _FakeSession()
+    with _test_env(sess):
+        influx_db.query_station_points(UID)
+    assert "runid" not in sess.calls[0]["body"]
+
+
+def test_kontostand_same_run_is_continued():
+    sess = _FakeSession({"SpieloAutomat": _konto_csv(endscore=89, runid=5)})
+    with _test_env(sess):
+        assert influx_db.query_kontostand(UID, "5") == 89
+    body = sess.calls[0]["body"]
+    assert 'r._measurement == "endscore_stationen"' in body
+    assert 'r._field == "endscore" or r._field == "runid"' in body
+
+
+def test_kontostand_from_older_run_is_ignored():
+    """Neuer Run -> nicht mit dem Kontostand des alten Runs weitermachen."""
+    sess = _FakeSession({"SpieloAutomat": _konto_csv(endscore=89, runid=4)})
+    with _test_env(sess):
+        assert influx_db.query_kontostand(UID, "5") is None
+
+
+def test_kontostand_without_runid_field_counts_as_other_run():
+    sess = _FakeSession({"SpieloAutomat": _konto_csv(endscore=89)})
+    with _test_env(sess):
+        assert influx_db.query_kontostand(UID, "5") is None
+
+
+def test_balance_new_run_starts_with_that_runs_station_points():
+    sess = _FakeSession({
+        "SpieloAutomat":   _konto_csv(endscore=89, runid=4),
+        "Gedaechtnistest": _value_csv(79),
+    })
+    with _test_env(sess):
+        assert influx_db.query_balance(UID, "5") == 79
+
+
+def test_write_spielstand_adds_runid_field_to_both_points():
+    sess = _FakeSession()
+    with _test_env(sess):
+        assert influx_db.write_spielstand(UID, live=89, glueck=67, runid="5")
+    assert sess.calls[0]["body"].strip().splitlines() == [
+        f'durchlauf,userid={UID} live=89i,endscore=67i,runid="5"',
+        f'endscore_stationen,userid={UID} endscore=89i,runid="5"',
+    ]
+
+
+def test_runid_is_field_not_tag():
+    """runid als Field: pro Spieler bleibt es EINE Serie - das Leaderboard
+    zeigt mit last() automatisch den neuesten Run."""
+    sess = _FakeSession()
+    with _test_env(sess):
+        influx_db.write_spielstand(UID, live=89, runid="5")
+    for line in sess.calls[0]["body"].strip().splitlines():
+        series = line.split(" ", 1)[0]
+        assert "runid" not in series

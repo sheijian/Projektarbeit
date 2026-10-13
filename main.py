@@ -147,6 +147,8 @@ class App:
         # session_plays beim letzten Glückswert-Write - verhindert, dass ein
         # Durchlauf doppelt gespeichert wird (z. B. Logout zweimal gedrückt).
         self._glueck_saved_plays = 0
+        # Run-Nummer des angemeldeten Spielers (vom ESP32), None = unbekannt.
+        self._runid: Optional[str] = None
 
         self._auto_login_pending: Optional[str] = None
         if args.offline and args.auto_login is not None:
@@ -207,17 +209,23 @@ class App:
                 self._login_by_uid(uid)
 
     def _login_by_uid(self, uid: str) -> None:
-        log.info("RFID gelesen: %s", uid)
+        runid = (self.rfid.get_runid(uid)
+                 if isinstance(self.rfid, HTTPRFIDReader) else None)
+        log.info("RFID gelesen: %s (runid %s)", uid, runid)
         self._login_retry = None
-        # Anderer Chip, während noch jemand spielt -> dessen Durchlauf beenden.
-        if self.game.player is not None and self.game.player.rfid != uid:
+        # Anderer Chip oder neuer Run, während noch jemand spielt ->
+        # dessen Durchlauf beenden.
+        if self.game.player is not None and (
+            self.game.player.rfid != uid or self._runid != runid
+        ):
             self._finish_session()
+        self._runid = runid
 
         # 1) Kontostand: letzter Wert aus SpieloAutomat endscore_stationen/
-        #    endscore, falls der Spieler schon gespielt hat - sonst Summe
-        #    der sechs Stationen.
+        #    endscore, falls der Spieler in diesem Run schon gespielt hat -
+        #    sonst Summe der sechs Stationen in diesem Run.
         try:
-            score = influx_db.query_balance(uid)
+            score = influx_db.query_balance(uid, runid)
         except influx_db.DBError as e:
             # Kein Ersatzwert - sonst würde der echte Kontostand nach der
             # ersten Hand überschrieben. Später nochmal versuchen.
@@ -247,8 +255,8 @@ class App:
             player.name = name
 
         log.info(
-            "Login: userid=%s | name=%s | balance=%d",
-            player.rfid, player.name, player.balance,
+            "Login: userid=%s | runid=%s | name=%s | balance=%d",
+            player.rfid, runid, player.name, player.balance,
         )
         self._glueck_saved_plays = 0
         self.game.login(player, default_bet=self.args.default_bet)
@@ -271,6 +279,7 @@ class App:
             return
         log.info("Auto-Login: %s (Guthaben %d)", player.name, player.balance)
         self._glueck_saved_plays = 0
+        self._runid = None
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
@@ -312,7 +321,9 @@ class App:
                         live, glueck)
             return True
         try:
-            return influx_db.write_spielstand(player.rfid, live=live, glueck=glueck)
+            return influx_db.write_spielstand(
+                player.rfid, live=live, glueck=glueck, runid=self._runid,
+            )
         except Exception as e:
             log.warning("write_spielstand fehlgeschlagen: %s", e)
             return False

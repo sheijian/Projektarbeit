@@ -3,6 +3,7 @@
 Aufruf (auf dem Pi, im Projektordner):
 
     python -m scripts.punkte <userid>            # Punkte, Kontostand, Glück
+    python -m scripts.punkte <userid> --run 5    # nur Run 5 (runid vom ESP32)
     python -m scripts.punkte --schema            # echtes DB-Schema
     python -m scripts.punkte <userid> --reset    # Spielstand löschen
 
@@ -29,12 +30,12 @@ import sys
 from blackjack import influx_db
 
 
-def show_points(uid: str) -> int:
+def show_points(uid: str, runid=None) -> int:
     schemas = ", ".join(f"{m}/{f}" for m, f in influx_db.STATION_SCHEMAS)
-    print(f"userid {uid}")
+    print(f"userid {uid}  |  Run: {'alle' if runid is None else runid}")
     print(f"Stationen: {schemas}, Tag {' oder '.join(influx_db.STATION_TAGS)}\n")
-    points = influx_db.query_station_points(uid)
-    konto = influx_db.query_kontostand(uid)
+    points = influx_db.query_station_points(uid, runid)
+    konto = influx_db.query_kontostand(uid, runid)
     live = influx_db.query_live(uid)
     glueck = influx_db.query_glueck(uid)
 
@@ -92,6 +93,8 @@ def reset(uid: str) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description="Punkte eines Spielers prüfen")
     p.add_argument("userid", nargs="?")
+    p.add_argument("--run", metavar="RUNID",
+                   help="nur diesen Run auswerten (wie beim Login am Automaten)")
     p.add_argument("--schema", action="store_true",
                    help="measurement/field/tags aller Buckets anzeigen")
     p.add_argument("--reset", action="store_true",
@@ -112,7 +115,7 @@ def main() -> int:
         uid = args.userid.strip()
         if args.reset:
             return reset(uid)
-        return show_points(uid)
+        return show_points(uid, args.run)
     except influx_db.DBError as e:
         print(f"Datenbank-Fehler: {e}")
         return 1

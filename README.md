@@ -164,9 +164,39 @@ Explorer mit „Past 1h“ unsichtbar.
 
 ```bash
 python -m scripts.punkte <userid>            # Punkte je Station, Kontostand, live, Glücksfaktor
+python -m scripts.punkte <userid> --run 5    # dasselbe nur für Run 5
 python -m scripts.punkte --schema            # was wirklich in jedem Bucket steht
 python -m scripts.punkte <userid> --reset    # alles in SpieloAutomat löschen -> wieder Startguthaben
 ```
+
+### Mehrere Runs (`runid`)
+
+Eine Karte kann mehrmals spielen. Der ESP32 liefert dazu eine Run-Nummer
+(`"runid":"5"` in der Statusseite), die Stationen speichern sie als Tag
+`runid` bzw. `run_id`.
+
+- **Startguthaben** = nur die Stationspunkte **dieses** Runs.
+- **Kontostand** (`endscore_stationen/endscore`) gilt nur im selben Run –
+  wer im selben Run nochmal kommt, macht weiter; ein neuer Run startet
+  frisch mit den Stationspunkten des neuen Runs.
+- Blackjack schreibt die Run-Nummer in jeden Datenpunkt als **Field**
+  `runid` (z. B. `durchlauf,userid=… live=89i,endscore=67i,runid="5"`).
+- Wechselt bei gleicher Karte der Run, ist das ein neuer Durchlauf.
+
+**Nichts wird überschrieben.** InfluxDB hängt jeden Wert als neuen
+Datenpunkt an. Weil `runid` ein Field und kein Tag ist, bleibt es pro
+Spieler **eine** Serie – ein Leaderboard mit `last()` zeigt automatisch
+den neuesten Run, ohne Änderung an der Abfrage:
+
+```flux
+from(bucket: "SpieloAutomat")
+  |> range(start: 0)
+  |> filter(fn: (r) => r._measurement == "durchlauf" and r._field == "live")
+  |> last()
+```
+
+Die alten Runs bleiben als Verlauf erhalten (z. B. für „bester Run“ mit
+`max()` statt `last()`).
 
 ### Logout (Taster K5, Taste `L` oder LOGOUT antippen)
 
