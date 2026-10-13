@@ -197,10 +197,10 @@ def test_station_points_raises_on_db_error():
 
 
 # ---------------------------------------------------------------------------
-# query_live / query_glueck / query_balance
+# query_kontostand / query_live / query_glueck / query_balance
 # ---------------------------------------------------------------------------
 class _FieldSession(_FakeSession):
-    """SpieloAutomat antwortet je nach abgefragtem Field (live/endscore)."""
+    """SpieloAutomat antwortet je nach "measurement/field"."""
 
     def __init__(self, fields, buckets=None):
         super().__init__(buckets)
@@ -208,13 +208,27 @@ class _FieldSession(_FakeSession):
 
     def post(self, url, params=None, headers=None, data=None, timeout=None):
         body = data.decode("utf-8") if isinstance(data, bytes) else data
-        m = re.search(r'from\(bucket: "SpieloAutomat"\).*r\._field == "(\w+)"',
+        m = re.search(r'from\(bucket: "SpieloAutomat"\).*'
+                      r'r\._measurement == "(\w+)" and r\._field == "(\w+)"',
                       body, re.S)
         if m:
             self.calls.append({"url": url, "params": params,
                                "headers": headers, "body": body})
-            return self.fields.get(m.group(1), _Response(text=EMPTY_CSV))
+            key = f"{m.group(1)}/{m.group(2)}"
+            return self.fields.get(key, _Response(text=EMPTY_CSV))
         return super().post(url, params, headers, data, timeout)
+
+
+def test_query_kontostand_reads_endscore_stationen():
+    sess = _FakeSession({"SpieloAutomat": _value_csv(69)})
+    with _test_env(sess):
+        assert influx_db.query_kontostand(UID) == 69
+    body = sess.calls[0]["body"]
+    assert 'from(bucket: "SpieloAutomat")' in body
+    assert ('r._measurement == "endscore_stationen" and '
+            'r._field == "endscore"') in body
+    assert f'r.userid == "{UID}"' in body
+    assert "|> last()" in body
 
 
 def test_query_live_reads_spieloautomat_live_field():
@@ -228,25 +242,31 @@ def test_query_live_reads_spieloautomat_live_field():
     assert "|> last()" in body
 
 
-def test_query_glueck_reads_endscore_field():
-    sess = _FieldSession({"endscore": _value_csv(50)})
+def test_query_glueck_reads_durchlauf_endscore():
+    sess = _FieldSession({"durchlauf/endscore": _value_csv(50)})
     with _test_env(sess):
         assert influx_db.query_glueck(UID) == 50
 
 
-def test_query_balance_uses_live_never_the_luck_score():
-    """endscore in SpieloAutomat ist jetzt der Glückswert (%) - der darf
-    niemals als Guthaben geladen werden."""
-    sess = _FieldSession({"live": _value_csv(69), "endscore": _value_csv(50)},
-                         {"HeisserDraht": _value_csv(21)})
+def test_query_balance_loads_only_endscore_stationen():
+    """Login lädt aus endscore_stationen/endscore - nie aus durchlauf/live
+    (Dashboard) oder durchlauf/endscore (Glücksfaktor)."""
+    sess = _FieldSession({
+        "endscore_stationen/endscore": _value_csv(69),
+        "durchlauf/live":              _value_csv(70),
+        "durchlauf/endscore":          _value_csv(50),
+    }, {"HeisserDraht": _value_csv(21)})
     with _test_env(sess):
         assert influx_db.query_balance(UID) == 69
 
 
-def test_query_balance_luck_score_alone_is_no_balance():
-    """Nur ein Glückswert, aber (noch) kein live -> Startguthaben."""
-    sess = _FieldSession({"endscore": _value_csv(50)},
-                         {"HeisserDraht": _value_csv(21)})
+def test_query_balance_dashboard_values_alone_are_no_balance():
+    """Nur durchlauf/live + Glücksfaktor (z. B. alte Daten), aber noch kein
+    Kontostand in endscore_stationen -> Startguthaben aus den Stationen."""
+    sess = _FieldSession({
+        "durchlauf/live":     _value_csv(70),
+        "durchlauf/endscore": _value_csv(50),
+    }, {"HeisserDraht": _value_csv(21)})
     with _test_env(sess):
         assert influx_db.query_balance(UID) == 21
 
@@ -348,17 +368,21 @@ def test_write_spielstand_live_only_after_each_hand():
     }
     assert call["headers"]["Authorization"] == "Token tw"
     # Ohne Zeitstempel - InfluxDB setzt die Serverzeit (Pi-Uhr geht falsch).
+    # Guthaben an beide Stellen: Dashboard + Kontostand für den Login.
     assert call["body"].strip().splitlines() == [
         f"durchlauf,userid={UID} live=69i",
+        f"endscore_stationen,userid={UID} endscore=69i",
     ]
 
 
-def test_write_spielstand_live_and_luck_in_one_point():
+def test_write_spielstand_live_and_luck_at_logout():
     sess = _FakeSession()
     with _test_env(sess):
         assert influx_db.write_spielstand(UID, live=69, glueck=50) is True
+    assert len(sess.calls) == 1                     # ein Request
     assert sess.calls[0]["body"].strip().splitlines() == [
         f"durchlauf,userid={UID} live=69i,endscore=50i",
+        f"endscore_stationen,userid={UID} endscore=69i",
     ]
 
 
@@ -366,6 +390,7 @@ def test_write_spielstand_luck_only():
     sess = _FakeSession()
     with _test_env(sess):
         assert influx_db.write_spielstand(UID, glueck=67) is True
+    # Nur Glücksfaktor -> Kontostand bleibt unberührt.
     assert sess.calls[0]["body"].strip() == f"durchlauf,userid={UID} endscore=67i"
 
 
@@ -381,12 +406,17 @@ def test_delete_spielstand_targets_only_this_player_in_spieloautomat():
     sess = _FakeSession()
     with _test_env(sess):
         assert influx_db.delete_spielstand(UID) is True
-    call = sess.calls[0]
-    assert call["url"] == "http://example.local/api/v2/delete"
-    assert call["params"] == {"org": "o", "bucket": "SpieloAutomat"}
-    assert call["headers"]["Authorization"] == "Token tw"
-    body = json.loads(call["body"])
-    assert body["predicate"] == f'_measurement="durchlauf" AND userid="{UID}"'
+    # Ein Request pro Measurement (Delete-Prädikat kennt kein OR).
+    predicates = []
+    for call in sess.calls:
+        assert call["url"] == "http://example.local/api/v2/delete"
+        assert call["params"] == {"org": "o", "bucket": "SpieloAutomat"}
+        assert call["headers"]["Authorization"] == "Token tw"
+        predicates.append(json.loads(call["body"])["predicate"])
+    assert predicates == [
+        f'_measurement="durchlauf" AND userid="{UID}"',
+        f'_measurement="endscore_stationen" AND userid="{UID}"',
+    ]
 
 
 def test_list_schema_shows_measurement_field_and_tags():

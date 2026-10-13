@@ -18,10 +18,13 @@ Beispiele:
     # Live-Reader-Test mit beliebigem Startguthaben
     python main.py --starting-balance 500
 
-SpieloAutomat (measurement durchlauf, Tag userid):
-    live      Kontostand - nach jeder Hand
-    endscore  Glückswert (gewonnene / gespielte Hände in %) - am Ende
-              jedes Durchlaufs (Logout, Chip-Wechsel, RFID-Abmeldung, Ende)
+SpieloAutomat (Tag userid, measurement/field):
+    endscore_stationen/endscore  Kontostand - nach jeder Hand, daraus
+                                 lädt der Login
+    durchlauf/live               Guthaben nach jeder Hand (Dashboard)
+    durchlauf/endscore           Glücksfaktor (gewonnene / gespielte Hände
+                                 in %) - beim Logout bzw. Ende des Durchlaufs
+                                 (Chip-Wechsel, RFID-Abmeldung, Programmende)
 
 Logout (Taster K5, Taste L oder LOGOUT auf dem Bildschirm antippen):
 speichert Kontostand + Glückswert und meldet den RFID-User am ESP32 ab.
@@ -114,14 +117,15 @@ class App:
         # Zeige klar an, ob die InfluxDB-Verbindung bereit ist.
         if influx_db.INFLUX_TOKEN_READ:
             log.info(
-                "InfluxDB: %s (org=%s) - Schema %s/%s/%s, Startguthaben = "
-                "Summe aus %s, Spielstand nach %s (Fields %s + %s), "
+                "InfluxDB: %s (org=%s) - Startguthaben = Summe aus %s; "
+                "%s: Kontostand %s/%s, Dashboard %s/%s + %s/%s; "
                 "Username aus %s",
                 influx_db.INFLUX_URL, influx_db.INFLUX_ORG,
-                influx_db.MEASUREMENT, influx_db.FIELD, influx_db.TAG,
-                ", ".join(influx_db.STATION_BUCKETS),
-                influx_db.SCORE_BUCKET, influx_db.FIELD_LIVE,
-                influx_db.FIELD_GLUECK, influx_db.USERNAME_BUCKET,
+                ", ".join(influx_db.STATION_BUCKETS), influx_db.SCORE_BUCKET,
+                influx_db.KONTO_MEASUREMENT, influx_db.KONTO_FIELD,
+                influx_db.MEASUREMENT, influx_db.FIELD_LIVE,
+                influx_db.MEASUREMENT, influx_db.FIELD_GLUECK,
+                influx_db.USERNAME_BUCKET,
             )
         else:
             log.warning(
@@ -209,8 +213,9 @@ class App:
         if self.game.player is not None and self.game.player.rfid != uid:
             self._finish_session()
 
-        # 1) Kontostand: letzter Kontostand (live) aus SpieloAutomat, falls
-        #    der Spieler schon gespielt hat - sonst Summe der sechs Stationen.
+        # 1) Kontostand: letzter Wert aus SpieloAutomat endscore_stationen/
+        #    endscore, falls der Spieler schon gespielt hat - sonst Summe
+        #    der sechs Stationen.
         try:
             score = influx_db.query_balance(uid)
         except influx_db.DBError as e:
@@ -224,7 +229,7 @@ class App:
             return
         if score is None:
             log.warning(
-                "Keine Punkte für userid=%s (weder live noch Stationen) "
+                "Keine Punkte für userid=%s (weder Kontostand noch Stationen) "
                 "- nehme Fallback %d",
                 uid, self.args.starting_balance,
             )
@@ -269,12 +274,13 @@ class App:
         self.game.login(player, default_bet=self.args.default_bet)
 
     def _on_round_end(self, player: Player) -> None:
-        """Nach jeder Hand den Kontostand (live) speichern - falls jemand
+        """Nach jeder Hand das Guthaben speichern (durchlauf/live +
+        endscore_stationen/endscore) - auch für den Fall, dass jemand
         geht, ohne den Logout-Taster zu drücken."""
         self._save(player, live=player.balance)
 
     def _finish_session(self) -> bool:
-        """Durchlauf beenden: Glückswert (endscore) speichern, zwischen den
+        """Durchlauf beenden: Glücksfaktor (durchlauf/endscore) speichern, zwischen den
         Runden auch den Kontostand. Nur wenn in diesem Durchlauf gespielt
         wurde und er noch nicht gespeichert ist."""
         player = self.game.player
@@ -282,7 +288,7 @@ class App:
         if player is None or plays == 0 or plays == self._glueck_saved_plays:
             return True
         # Mitten in einer Hand ist der Einsatz schon abgezogen - dann den
-        # Kontostand nicht anfassen (live steht seit der letzten Hand).
+        # Kontostand nicht anfassen (steht seit der letzten Hand).
         live = player.balance if self.game.can_logout else None
         if not self._save(player, live=live, glueck=self.game.luck_percent):
             return False
@@ -295,13 +301,13 @@ class App:
         live: Optional[int] = None,
         glueck: Optional[int] = None,
     ) -> bool:
-        """Schreibt Kontostand und/oder Glückswert nach SpieloAutomat.
+        """Schreibt Guthaben und/oder Glücksfaktor nach SpieloAutomat.
 
         Ohne Schreib-Token (Offline-Test) gibt es nichts zu speichern -
         dann ``True``, damit der Logout trotzdem funktioniert.
         """
         if not influx_db.INFLUX_TOKEN_WRITE:
-            log.warning("Nicht gespeichert (live=%s, endscore=%s): "
+            log.warning("Nicht gespeichert (Guthaben=%s, Glück=%s): "
                         "INFLUX_TOKEN_WRITE fehlt in blackjack/influx_db.py",
                         live, glueck)
             return True
@@ -333,7 +339,7 @@ class App:
             return
         glueck = self.game.luck_percent
         log.info("Logout: userid=%s | name=%s | %d Hände, %d gewonnen | "
-                 "live=%d | endscore=%s",
+                 "Guthaben=%d | Glück=%s",
                  player.rfid, player.name, self.game.session_plays,
                  self.game.session_wins, player.balance,
                  "-" if glueck is None else f"{glueck} %")
