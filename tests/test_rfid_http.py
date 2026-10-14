@@ -223,3 +223,43 @@ def test_without_runid_behaves_like_before():
     reader._process_uid("abc")
     reader._process_uid("abc")
     assert _events(reader) == ["abc"]
+
+
+def test_kristian_json_with_runid_zero():
+    """runid "0" ist ein gültiger Run - nicht mit "leer" verwechseln."""
+    payload = {"status": "logged_in",
+               "userid": "318bd674-f2cf-4efb-b9bf-d29f8370bab7",
+               "username": "kristian", "runid": "0", "time": 2}
+    assert _extract_scan(payload) == (
+        "318bd674-f2cf-4efb-b9bf-d29f8370bab7", "kristian",
+    )
+    assert _extract_runid(payload) == "0"
+    assert _extract_runid({**payload, "runid": 0}) == "0"
+
+
+def test_run_zero_then_run_one_are_two_logins():
+    reader = _reader()
+    reader._process_uid("abc", "0")
+    reader._process_uid("abc", "0")
+    reader._process_uid("abc", "1")
+    assert _events(reader) == ["abc", "abc"]
+
+
+def test_relogin_after_logout_works_even_without_idle_status():
+    """Nach unserem Logout wird der alte Login nur kurz ignoriert. Meldet
+    der ESP32 danach (ohne "nicht eingeloggt" dazwischen) dieselbe Karte,
+    ist das ein neuer Login - sonst käme der Teilnehmer im selben Run
+    nicht mehr rein."""
+    reader = _reader()
+    reader._process_uid("abc", "0")
+    _events(reader)
+    calls, restore = _with_requests()
+    try:
+        assert reader.logout() is True
+    finally:
+        restore()
+    reader._process_uid("abc", "0")              # sofort: alter Status
+    assert _events(reader) == []
+    reader._ignore_until = 0.0                   # Ignorier-Fenster vorbei
+    reader._process_uid("abc", "0")
+    assert _events(reader) == ["abc"]

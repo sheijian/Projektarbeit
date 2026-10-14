@@ -115,6 +115,10 @@ class HTTPRFIDReader:
 
     POLL_INTERVAL = 0.5     # Sekunden zwischen Abfragen
     IDLE_TIMEOUT = 3.0      # Sekunden ohne Login → "abgemeldet"
+    # So lange nach unserem Logout wird ein noch gemeldeter alter Login
+    # ignoriert. Danach gilt er als neuer Login (z. B. Karte gleich wieder
+    # aufgelegt, ohne dass wir "nicht eingeloggt" gesehen haben).
+    IGNORE_AFTER_LOGOUT = 5.0
 
     def __init__(
         self,
@@ -135,8 +139,10 @@ class HTTPRFIDReader:
         self._last_runid: Optional[str] = None
         self._last_seen: float = 0.0
         # Nach unserem Logout meldet der ESP32 evtl. noch kurz den alten
-        # User - diese UID ignorieren, bis einmal "nicht eingeloggt" kam.
+        # User - diese UID ignorieren, bis "nicht eingeloggt" kam, höchstens
+        # aber IGNORE_AFTER_LOGOUT Sekunden.
         self._ignore_uid: Optional[str] = None
+        self._ignore_until: float = 0.0
         # Von UID auf zuletzt gesehenen Anzeigenamen (für "Spieler:" im HUD).
         self._names: Dict[str, str] = {}
         # Von UID auf aktuelle Run-Nummer.
@@ -195,7 +201,9 @@ class HTTPRFIDReader:
                     self.events.put(None)
                 return
             if uid == self._ignore_uid:
-                return
+                if now < self._ignore_until:
+                    return
+                self._ignore_uid = None
             self._last_seen = now
             # Neuer Login: andere Karte - oder gleiche Karte, neuer Run.
             new_run = runid is not None and runid != self._last_runid
@@ -235,6 +243,7 @@ class HTTPRFIDReader:
             return False
         with self._lock:
             self._ignore_uid = self._last_uid
+            self._ignore_until = time.monotonic() + self.IGNORE_AFTER_LOGOUT
             self._last_uid = None
             self._last_runid = None
         log.info("RFID-Logout OK (%s)", self.logout_url)

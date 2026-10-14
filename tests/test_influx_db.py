@@ -575,3 +575,28 @@ def test_runid_is_field_not_tag():
     for line in sess.calls[0]["body"].strip().splitlines():
         series = line.split(" ", 1)[0]
         assert "runid" not in series
+
+
+def test_same_run_after_losing_everything_shows_zero():
+    """Kristian, Run 0: alles verspielt -> im selben Run wieder 0 (nicht
+    das Startguthaben der Stationen)."""
+    sess = _FakeSession({
+        "SpieloAutomat":   _konto_csv(endscore=0, runid=0),
+        "Gedaechtnistest": _value_csv(20),
+    })
+    with _test_env(sess):
+        assert influx_db.query_balance(UID, "0") == 0
+
+
+def test_next_run_uses_station_points_of_that_run():
+    """Kristian, Run 1: Kontostand von Run 0 zählt nicht mehr - es gilt das,
+    was er in Run 1 an den Stationen geholt hat."""
+    sess = _FakeSession({
+        "SpieloAutomat":   _konto_csv(endscore=0, runid=0),
+        "Gedaechtnistest": _value_csv(80),
+    })
+    with _test_env(sess):
+        assert influx_db.query_balance(UID, "1") == 80
+    station_query = [c["body"] for c in sess.calls
+                     if 'from(bucket: "Gedaechtnistest")' in c["body"]][0]
+    assert '(exists r.runid and r.runid == "1")' in station_query
